@@ -6,7 +6,7 @@ on:
       run:
         description: 'Der vom Worker erkannte Lauf'
         required: true
-        type: string  # Definiert den Typ explizit als String
+        type: string
 
 concurrency:
   group: pipeline-${{ github.ref }}
@@ -18,9 +18,9 @@ permissions:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    
+
     steps:
-      - name: Checkout Code (main)
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Checkout Existing Data (gh-pages)
@@ -52,13 +52,10 @@ jobs:
           cd output
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
-          # Erstellt einen frischen Branch ohne History (falls er neu ist) 
-          # oder hält die Datei-Nachverfolgung sauber aufrecht
+
           git checkout --orphan temp-branch || true
-          
+
           git add -A
           git commit -m "Weather Pipeline - Live State [skip ci]"
-          
-          # Drückt den Commit als einzigen Commit auf gh-pages
+
           git push --force origin HEAD:gh-pages
