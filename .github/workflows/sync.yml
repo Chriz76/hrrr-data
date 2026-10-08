@@ -1,0 +1,64 @@
+name: Run Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'Der vom Worker erkannte Lauf'
+        required: true
+        type: string  # Definiert den Typ explizit als String
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code (main)
+        uses: actions/checkout@v4
+
+      - name: Checkout Existing Data (gh-pages)
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: output
+          fetch-depth: 1
+        continue-on-error: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r pipeline/requirements.txt
+
+      - name: Run pipeline
+        env:
+          TARGET_RUN: ${{ github.event.inputs.run }}
+        run: python pipeline/src/pipeline.py
+
+      - name: Force-Push Data Branch (gh-pages)
+        run: |
+          cd output
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Erstellt einen frischen Branch ohne History (falls er neu ist) 
+          # oder hält die Datei-Nachverfolgung sauber aufrecht
+          git checkout --orphan temp-branch || true
+          
+          git add -A
+          git commit -m "Weather Pipeline - Live State [skip ci]"
+          
+          # Drückt den Commit als einzigen Commit auf gh-pages
+          git push --force origin HEAD:gh-pages
