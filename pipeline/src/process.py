@@ -170,7 +170,7 @@ PMTILES_TILE_PADDING = 1
 # Gueltiger Wertebereich des Praediktors wird auf +-100 m/s geklemmt (physikalisch
 # nie erreicht). Das garantiert, dass jedes Delta sicher in int16 passt:
 #     |Sentinel| + max|q| = 20000 + 10000 = 30000 < 32767
-PRED_SCALE = 0.01              # m/s pro int16-Schritt
+PRED_SCALE = 0.05              # m/s pro int16-Schritt
 PRED_VALID_MAX = 10000         # entspricht +-100 m/s
 PRED_SENTINEL = -20000         # int16-Sentinel fuer NaN (~ -200 m/s)
 PRED_GZIP_LEVEL = int(os.environ.get("PRED_GZIP_LEVEL", 1))   # 1 (schnell) .. 9
