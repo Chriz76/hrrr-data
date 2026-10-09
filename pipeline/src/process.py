@@ -146,7 +146,7 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 #
 # Das native HRRR-Raster ist 3 km = ~0,027°: 0,025° überabtastet es also noch,
 # 0,05° unterabtastet es um ~1,85x. finest_stride = 2 ist daher ECHTER Detailverlust.
-PMTILES_MAX_ZOOM = 7
+PMTILES_MAX_ZOOM = 8
 PMTILES_FINEST_STRIDE = 1
 
 # Jede Kachel bekommt PMTILES_TILE_PADDING Zellen Halo auf allen 4 Seiten.
