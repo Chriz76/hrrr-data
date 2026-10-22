@@ -20,8 +20,8 @@ except ImportError:
 
 
 # --- KONFIGURATION ---
-OUTPUT_DIR = "./output"
-TEMP_OM_DIR = "./om_temp"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./output")
+TEMP_OM_DIR = os.environ.get("TEMP_OM_DIR", "./om_temp")
 API_VERSION = "1.1.0"
 
 # Open-Meteo Modellname aus S3. Es gibt nur noch EINEN Datensatz: der
@@ -48,6 +48,12 @@ META_DIR_NAME = "meta"
 #
 # Bei 40 Sets wären es ~24.520 Dateien -> über dem Free-Limit. Wer mehr braucht:
 # bezahlter Plan (100k) oder R2 + Worker (kein Dateilimit).
+#
+# Ein voller Run liefert aktuell ~37 Zeitstempel (25 x 15-min bis +6h, dann 12
+# stündliche bis +18h). Da es keinen gh-pages-Checkout mehr gibt, enthält der
+# Deploy-Ordner genau diesen Run -> bei 30 werden die 7 FERNSTEN abgeschnitten
+# (Horizont endet dann bei ~+11h statt +18h). Voller Horizont = MAX_TILE_DIRS
+# auf 40 setzen UND einen bezahlten Plan (100k Dateien) verwenden.
 MAX_TILE_DIRS = int(os.environ.get("MAX_TILE_DIRS", "30"))
 # Auskommentiert: das Feld-WebP entfaellt, es gibt keine WebP-Dateien mehr zu zaehlen.
 # MAX_WEBP_COUNT = 200  # Maximal zu behaltende WebP-Dateien
@@ -146,11 +152,13 @@ def cleanup_old_files(output_dir, pattern, max_keep, label):
 
 
 def cleanup_old_tile_sets(output_dir, max_keep=MAX_TILE_DIRS):
-    """Löscht die ältesten Tile-Sets (tiles/<timestamp>/) inkl. ihrer Metadaten.
+    """Begrenzt die Zahl der Tile-Sets (tiles/<timestamp>/) inkl. ihrer Metadaten.
 
-    Die Zeitstempel-Namen sind lexikografisch sortierbar -> die ältesten Sets
-    stehen vorne. Gelöscht wird immer das komplette Verzeichnis, damit keine
-    verwaisten Kacheln zurückbleiben.
+    Die Zeitstempel-Namen sind lexikografisch sortierbar (ältester zuerst).
+    Behalten werden die ``max_keep`` zeitlich NÄCHSTEN Sets – das ist der
+    Deploy-Budget-Deckel für Cloudflare Pages (Dateilimit), kein Cross-Run-
+    Rolling-Window mehr. Gelöscht wird immer das komplette Verzeichnis, damit
+    keine verwaisten Kacheln zurückbleiben.
     """
     tiles_root = os.path.join(output_dir, TILES_DIR_NAME)
     if not os.path.isdir(tiles_root):
@@ -166,7 +174,18 @@ def cleanup_old_tile_sets(output_dir, max_keep=MAX_TILE_DIRS):
         return
 
     print(f"\n🧹 Bereinige alte Tile-Sets ({len(sets)} vorhanden, maximal {max_keep} erlaubt)...")
-    for name in sets[:-max_keep]:
+
+    # Kein gh-pages-Checkout mehr: der Deploy-Ordner enthält genau den aktuellen
+    # Run (Namen sind chronologisch sortierbar). Behalten werden deshalb die
+    # zeitlich NÄCHSTEN Schritte, die fernsten Prognosestunden fliegen raus.
+    dropped = sets[max_keep:]
+    if dropped:
+        print(
+            f"   ⚠️ {len(dropped)} Zeitstempel entfallen wegen Dateilimit: "
+            f"{dropped[0]} .. {dropped[-1]}"
+        )
+
+    for name in dropped:
         set_path = os.path.join(tiles_root, name)
         try:
             shutil.rmtree(set_path)

@@ -1,4 +1,4 @@
-name: Run Pipeline
+name: Run Pipeline & Deploy to Cloudflare Pages
 
 on:
   workflow_dispatch:
@@ -13,23 +13,24 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pipeline:
     runs-on: ubuntu-latest
 
+    env:
+      # Die Pipeline schreibt direkt in den Deploy-Ordner (OUTPUT_DIR ist in
+      # pipeline.py per Env überschreibbar, Default "./output").
+      OUTPUT_DIR: ./t
+      # Max. Tile-Sets (= Zeitstempel) pro Deployment. Cloudflare Pages erlaubt
+      # 20.000 Dateien (Free) bzw. 100.000 Dateien (bezahlte Pläne, wrangler v4).
+      # Budget: 30 x ~613 Kacheln + 30 Metadaten + index.json/_headers ≈ 18.4k.
+      MAX_TILE_DIRS: '30'
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      - name: Checkout Existing Data (gh-pages)
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          path: output
-          fetch-depth: 1
-        continue-on-error: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,15 +48,19 @@ jobs:
           TARGET_RUN: ${{ github.event.inputs.run }}
         run: python pipeline/src/pipeline.py
 
-      - name: Force-Push Data Branch (gh-pages)
+      - name: Dateilimit prüfen (Cloudflare Pages)
         run: |
-          cd output
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          COUNT=$(find t -type f | wc -l)
+          echo "Dateien im Deploy-Ordner t/: $COUNT"
+          if [ "$COUNT" -gt 19900 ]; then
+            echo "::error::$COUNT Dateien überschreiten das Cloudflare-Pages-Limit (Free: 20.000). MAX_TILE_DIRS reduzieren oder bezahlter Plan + PAGES_WRANGLER_MAJOR_VERSION=4 (100.000 Dateien) verwenden."
+            exit 1
+          fi
 
-          git checkout --orphan temp-branch || true
-
-          git add -A
-          git commit -m "Weather Pipeline - Live State [skip ci]"
-
-          git push --force origin HEAD:gh-pages
+      - name: wrangler deploy ausführen
+        env:
+          # Falls das Secret noch "NETLIFY_AUTH_TOKEN" heißt, wird es als Fallback genutzt.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.NETLIFY_AUTH_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: c728452fcd5090f3d7f2bacc5e75fcd2
+        run: |
+          time npx --yes wrangler@latest pages deploy t --project-name winddata --commit-dirty=true
