@@ -28,7 +28,27 @@ API_VERSION = "1.1.0"
 # 15-Minuten-Datensatz deckt denselben Zeitraum ab wie der stündliche
 # ('ncep_hrrr_conus'), also werden auch die ganzen Stunden aus ihm geholt.
 MODEL_NAME_15MIN = "ncep_hrrr_conus_15min"  # HRRR: stündliche Runs, 15-Min-Schritte
-MAX_PMTILES_COUNT = 200  # Maximal zu behaltende PMTiles-Dateien
+
+# Ablage der Tiles im Deploy-Ordner (siehe process.py):
+#     tiles/<timestamp>/<z>/<x>/<y>.bin   (bereits gzip-komprimiert)
+#     meta/<timestamp>.json               (unkomprimiertes JSON)
+TILES_DIR_NAME = "tiles"
+META_DIR_NAME = "meta"
+
+# Maximal zu behaltende Tile-Sets (ein Set = ein Zeitstempel = tiles/<ts>/...).
+#
+# Cloudflare-Pages-Limit: 20.000 Dateien (Free) bzw. 100.000 Dateien (bezahlte
+# Pläne, dafür PAGES_WRANGLER_MAJOR_VERSION=4 setzen).
+#
+# Budget bei 30 Sets:
+#     30 x ~613 Kacheln      = ~18.390 Dateien
+#     + 30 meta/*.json       =      30
+#     + index.json + _headers=       2
+#     ------------------------------- ~18.422 Dateien < 20.000  -> passt (Free).
+#
+# Bei 40 Sets wären es ~24.520 Dateien -> über dem Free-Limit. Wer mehr braucht:
+# bezahlter Plan (100k) oder R2 + Worker (kein Dateilimit).
+MAX_TILE_DIRS = int(os.environ.get("MAX_TILE_DIRS", "30"))
 # Auskommentiert: das Feld-WebP entfaellt, es gibt keine WebP-Dateien mehr zu zaehlen.
 # MAX_WEBP_COUNT = 200  # Maximal zu behaltende WebP-Dateien
 
@@ -40,6 +60,32 @@ HORIZON_END_HOURS = 18     # letzter Schritt (volle Stunde) bei +18h
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_OM_DIR, exist_ok=True)
+
+
+def ensure_headers_file(output_dir):
+    """Kopiert die `_headers`-Datei aus pipeline/static/ in das Deploy-Verzeichnis.
+
+    Die Datei ist zwingend nötig: die Tiles liegen bereits gzip-komprimiert auf
+    der Platte und werden nur über `Content-Encoding: gzip` korrekt ausgeliefert.
+    """
+    dst = os.path.join(output_dir, "_headers")
+    base_dir = (
+        os.path.dirname(os.path.abspath(__file__))
+        if "__file__" in globals()
+        else os.getcwd()
+    )
+    src = os.path.abspath(os.path.join(base_dir, os.pardir, "static", "_headers"))
+
+    if os.path.isfile(src):
+        shutil.copyfile(src, dst)
+        print(f"✅ _headers bereitgestellt: {dst}")
+    elif os.path.exists(dst):
+        print(f"ℹ️ _headers bereits vorhanden: {dst}")
+    else:
+        print(f"⚠️ _headers nicht gefunden (weder {src} noch {dst})")
+
+
+ensure_headers_file(OUTPUT_DIR)
 
 
 def download_file(url, local_path):
@@ -99,9 +145,54 @@ def cleanup_old_files(output_dir, pattern, max_keep, label):
 #     cleanup_old_files(output_dir, "*.webp", max_keep, "WebP-Dateien")
 
 
-def cleanup_old_pmtiles(output_dir, max_keep=200):
-    """Löscht ältere PMTiles-Dateien im Ausgabeordner basierend auf dem Dateinamen."""
-    cleanup_old_files(output_dir, "*_dir.pmtiles", max_keep, "PMTiles-Dateien")
+def cleanup_old_tile_sets(output_dir, max_keep=MAX_TILE_DIRS):
+    """Löscht die ältesten Tile-Sets (tiles/<timestamp>/) inkl. ihrer Metadaten.
+
+    Die Zeitstempel-Namen sind lexikografisch sortierbar -> die ältesten Sets
+    stehen vorne. Gelöscht wird immer das komplette Verzeichnis, damit keine
+    verwaisten Kacheln zurückbleiben.
+    """
+    tiles_root = os.path.join(output_dir, TILES_DIR_NAME)
+    if not os.path.isdir(tiles_root):
+        return
+
+    sets = sorted(
+        name for name in os.listdir(tiles_root)
+        if os.path.isdir(os.path.join(tiles_root, name))
+    )
+
+    if len(sets) <= max_keep:
+        print(f"ℹ️ Tile-Sets: {len(sets)} vorhanden (maximal {max_keep}) – nichts zu löschen.")
+        return
+
+    print(f"\n🧹 Bereinige alte Tile-Sets ({len(sets)} vorhanden, maximal {max_keep} erlaubt)...")
+    for name in sets[:-max_keep]:
+        set_path = os.path.join(tiles_root, name)
+        try:
+            shutil.rmtree(set_path)
+            meta_path = os.path.join(output_dir, META_DIR_NAME, f"{name}.json")
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
+            print(f"   🗑️ Gelöscht: {TILES_DIR_NAME}/{name}")
+        except Exception as e:
+            print(f"   ⚠️ Fehler beim Löschen von {set_path}: {e}")
+
+    remaining = sorted(
+        name for name in os.listdir(tiles_root)
+        if os.path.isdir(os.path.join(tiles_root, name))
+    )
+    print(f"✅ Bereinigung abgeschlossen. Es verbleiben {len(remaining)} Tile-Sets.")
+
+
+def existing_tile_sets(output_dir):
+    """Liefert die Menge der Zeitstempel (mit 'Z'), für die Kacheln vorliegen."""
+    tiles_root = os.path.join(output_dir, TILES_DIR_NAME)
+    if not os.path.isdir(tiles_root):
+        return set()
+    return {
+        name for name in os.listdir(tiles_root)
+        if os.path.isdir(os.path.join(tiles_root, name))
+    }
         
 
 def run_hrrr_pipeline():
@@ -142,8 +233,8 @@ def run_hrrr_pipeline():
     horizon_15min = target_time + timedelta(hours=HORIZON_15MIN_HOURS)
     while consecutive_missing < 2 and current_step_time <= horizon_15min:
         time_key = current_step_time.strftime("%Y%m%d_%H%M")  # HHMM-Format
-        # Traegt nur noch den Zeitstempel als Namensbasis; es wird ausschliesslich
-        # eine PMTiles-Datei ("...Z_dir.pmtiles") geschrieben.
+        # Traegt nur noch den Zeitstempel als Namensbasis; pro Kachel entsteht
+        # eine einzelne gzip-Datei unter tiles/<timestamp>/<z>/<x>/<y>.bin.
         output_name = f"{time_key}Z"
         iso_file_name = f"{current_step_time.strftime('%Y-%m-%dT%H%M')}.om"
 
@@ -163,7 +254,7 @@ def run_hrrr_pipeline():
 
             if success:
                 processed_timestamps_15m.append(time_key)
-                print(f"      ✅ Erfolgreich prozessiert -> {time_key}Z_dir.pmtiles")
+                print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
         else:
             consecutive_missing += 1
             print(
@@ -209,7 +300,7 @@ def run_hrrr_pipeline():
 
             if success:
                 timestamps_hourly.append(time_key)
-                print(f"      ✅ Erfolgreich prozessiert -> {time_key}Z_dir.pmtiles")
+                print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
         else:
             consecutive_missing += 1
             print(
@@ -218,10 +309,17 @@ def run_hrrr_pipeline():
 
         current_hour_time += timedelta(hours=1)
 
-    # 3. BEIDE TIMESTAMPS VERBINDEN & INDEX.JSON EINMALIG GENERIEREN
+    # 3. AUFRÄUMEN, DANN INDEX.JSON GENERIEREN
+    #
+    # Bewusst in dieser Reihenfolge: der Index darf nur Zeitstempel auflisten,
+    # für die nach dem Aufräumen auch noch Kacheln auf der Platte liegen.
+    cleanup_old_tile_sets(OUTPUT_DIR, max_keep=MAX_TILE_DIRS)
+
     all_timestamps = sorted(
         list(set(processed_timestamps_15m + timestamps_hourly))
     )
+    present_sets = existing_tile_sets(OUTPUT_DIR)
+    all_timestamps = [ts for ts in all_timestamps if f"{ts}Z" in present_sets]
 
     if all_timestamps:
         index_path = os.path.join(OUTPUT_DIR, "index.json")
@@ -240,6 +338,9 @@ def run_hrrr_pipeline():
             "current_hour": current_hour,
             "step_type": "15min",
             "api_version": API_VERSION,
+            # Templates fuer die Web-App: {timestamp} = "20261008_2000Z"
+            "tiles_url": f"{TILES_DIR_NAME}/{{timestamp}}/{{z}}/{{x}}/{{y}}.bin",
+            "meta_url": f"{META_DIR_NAME}/{{timestamp}}.json",
         }
 
         print(f"\n📝 Generiere {index_path}...")
@@ -258,9 +359,6 @@ def run_hrrr_pipeline():
     # (auskommentiert: es werden keine Feld-WebPs mehr erzeugt)
     # cleanup_old_webps(OUTPUT_DIR, max_keep=MAX_WEBP_COUNT)
 
-    # Alte PMTiles-Dateien nach Dateinamen-Sortierung bereinigen
-    cleanup_old_pmtiles(OUTPUT_DIR, max_keep=MAX_PMTILES_COUNT)
-    
     # Aufräumen
     if os.path.exists(TEMP_OM_DIR):
         shutil.rmtree(TEMP_OM_DIR)

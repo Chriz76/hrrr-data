@@ -1,12 +1,12 @@
 import os
 import gzip
+import json
 import math
+import shutil
 import time
 import numpy as np
 from omfiles import OmFileReader
 from scipy.ndimage import map_coordinates
-from pmtiles.writer import Writer
-from pmtiles.tile import TileType, Compression, zxy_to_tileid
 
 
 # --- 1. GEO-HILFSFUNKTIONEN ---
@@ -115,13 +115,19 @@ HRRR_DX = float((_x_ne - _x_origin) / (HRRR_NX - 1))
 HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 
 
-# --- 3. PMTiles-PAYLOAD (int16-Delta + Ganz-Tile-gzip) ---
+# --- 3. TILE-PAYLOAD (int16-Delta + Ganz-Tile-gzip) ---
 #
 # Pro Kachel werden U und V als je ein zeilenweise delta-kodierter int16-Stream
 # abgelegt. Danach wird das KOMPLETTE Tile (Geo-Header + Laengen + beide Streams)
-# als EIN gzip-Strom komprimiert; der PMTiles-Header deklariert deshalb
-# tile_compression = GZIP (= gzip ueber das ganze Tile, wie in der Spec und im
-# Verhalten konformer Reader, z.B. pmtiles JS: getZxy -> decompress(ganzes Tile)).
+# als EIN gzip-Strom komprimiert und als eigene Datei abgelegt:
+#
+#     <output>/tiles/<timestamp>/<z>/<x>/<y>.bin
+#
+# Die Datei ist also ein fertiger gzip-Container. Der Host MUSS sie mit
+# "Content-Encoding: gzip" ausliefern (Cloudflare Pages: siehe _headers), sonst
+# sieht der Browser die gzip-Bytes als Nutzdaten. Mit dem Header entpackt der
+# Browser transparent, d.h. fetch(...).arrayBuffer() liefert wieder die rohen
+# Tile-Bytes (Geo-Header + Laengen + int16-Streams).
 #
 # Kachel-Aufbau VOR der gzip-Komprimierung:
 #     [Geo-Header 24B][u_len 4B][v_len 4B][u_int16_delta][v_int16_delta]
@@ -133,7 +139,7 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 #
 #     Level 0..max_zoom,   stride = finest_stride * 2^(max_zoom - z)
 #
-# PMTILES_MAX_ZOOM = 7 -> 8 Zoomstufen (0..7). Die feinste Stufe (z = 7) liegt bei
+# TILE_MAX_ZOOM = 7 -> 8 Zoomstufen (0..7). Die feinste Stufe (z = 7) liegt bei
 # stride = 1, also weiterhin auf voller Auflösung (0,025°). Gegenüber max_zoom = 8
 # bedeutet das: eine Stufe weniger, dafür deckt jede Kachel 2x2 Kacheln der alten
 # feinsten Stufe ab -> 4x mehr Zellen (und damit ~4x mehr Bytes) pro Kachel und 4x
@@ -141,7 +147,7 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 # Das passt zu 512-px-Kacheln im Frontend: deck.gl liest pro Kamerazoomstufe eine
 # Stufe gröber (z = round(cameraZoom) - 1).
 #
-# Die Bytes hängen allein an PMTILES_FINEST_STRIDE (Abtastschritt der feinsten Stufe)
+# Die Bytes hängen allein an TILE_FINEST_STRIDE (Abtastschritt der feinsten Stufe)
 # und skalieren mit dessen Quadrat:
 #
 #     finest_stride = 1  ->  feinste Auflösung 0,025°  ->  Gesamtdaten ~4N/3
@@ -149,17 +155,32 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 #
 # Das native HRRR-Raster ist 3 km = ~0,027°: 0,025° überabtastet es also noch,
 # 0,05° unterabtastet es um ~1,85x. finest_stride = 2 ist daher ECHTER Detailverlust.
-PMTILES_MAX_ZOOM = 7
-PMTILES_FINEST_STRIDE = 1
+TILE_MAX_ZOOM = 7
+TILE_FINEST_STRIDE = 1
 
-# Jede Kachel bekommt PMTILES_TILE_PADDING Zellen Halo auf allen 4 Seiten.
+# Ablage der Kacheln als einzelne Dateien (klassisches Tileserver-Layout):
+#
+#     <output>/tiles/<timestamp>/<z>/<x>/<y>.bin
+#     <output>/meta/<timestamp>.json
+#
+# Zur Dateiendung: Cloudflare & Co. erkennen an der Endung NICHT, dass die Datei
+# bereits gzip-komprimiert ist. Es gibt KEINE Endung, die automatisch
+# "Content-Encoding: gzip" setzt – auch ".gz" nicht (das liefert lediglich
+# "Content-Type: application/gzip", der Browser entpackt dann nichts). Der Header
+# kommt ausschliesslich aus der _headers-Datei. ".bin" ist daher neutral und wird
+# dort auf application/octet-stream + Content-Encoding: gzip gemappt.
+TILE_FILE_EXT = "bin"
+TILES_SUBDIR = "tiles"   # NUR gzip-komprimierte Tiles (siehe _headers!)
+META_SUBDIR = "meta"     # unkomprimiertes JSON – darf NICHT unter /tiles/ liegen
+
+# Jede Kachel bekommt TILE_PADDING Zellen Halo auf allen 4 Seiten.
 # Der Client interpoliert linear; ohne Halo fehlt ihm an den Kachelrändern der
 # äußere Stützpunkt und die Interpolation wird dort ungenau (identisch zur
 # D2-Pipeline). 1 = eine Zelle Überlappung. Der Geo-Header wächst mit
 # (origin = gepolsterte Nord-/West-Ecke, rows/cols aus dem Ausschnitt) – der
 # Client liest die Lage ohnehin aus dem Header, es muss nichts weiter angepasst
 # werden.
-PMTILES_TILE_PADDING = 1
+TILE_PADDING = 1
 
 
 # --- 5. PAYLOAD-VERFAHREN (Delta-Praediktor + Ganz-Tile-gzip) ---
@@ -187,7 +208,7 @@ class HrrrWindProcessor:
         # --- folgende zwei Schritte gehoeren nur zum Feld-WebP und sind auskommentiert ---
         # ("field", "Feldbild rendern"),
         # ("webp_save", "Feld-WebP speichern"),
-        ("pmtiles", "PMTiles bauen"),
+        ("tiles", "Tiles schreiben"),
         ("cleanup", "Temp loeschen"),
     )
 
@@ -197,16 +218,16 @@ class HrrrWindProcessor:
         os.makedirs(self.output_folder, exist_ok=True)
 
         # Messwerte des letzten Timesteps (werden von process_om_file bzw.
-        # _create_wind_direction_pmtiles gefüllt)
+        # _create_wind_direction_tiles gefüllt)
         self.last_step_timings = {}
-        self.last_pmtiles_stats = {}
+        self.last_tile_stats = {}
         # Diagnose des Resamples: hatte die Quelldatei NaN?
         # (siehe _resample_to_regular_grid)
         self.source_had_nan = False
         self._nan_warned = False
 
         self.width = width
-        # Auflösung des regulären Lat/Lon-Zwischengitters (Open-Meteo/PMTiles-kompatibel)
+        # Auflösung des regulären Lat/Lon-Zwischengitters (Open-Meteo-kompatibel)
         self.src_resolution = src_resolution
 
         # Geografische Hülle des nativen HRRR-CONUS-Rasters (aus der Projektion bestimmt)
@@ -222,7 +243,7 @@ class HrrrWindProcessor:
         self._build_resample_coords()
 
         # --- NUR FUER DAS FELD-WEBP (auskommentiert) ---------------------------------
-        # Das PMTiles-Artefakt braucht keines davon: es arbeitet direkt auf dem
+        # Das Tile-Artefakt braucht keines davon: es arbeitet direkt auf dem
         # regulären Lat/Lon-Zwischengitter. Gebraucht wurde es ausschliesslich fuer
         # das farbcodierte Windgeschwindigkeits-Overlay ("...Z.webp"), das ein
         # Mercator-Zielgitter mit fester Pixelbreite plus eine 13-Farben-Palette
@@ -393,8 +414,8 @@ class HrrrWindProcessor:
         geklemmt ist, passt jedes Delta sicher in int16 (siehe Konstanten oben).
 
         Rückgabe sind die ROHEN int16-Bytes. Die gzip-Komprimierung passiert
-        anschliessend über das KOMPLETTE Tile in ``_create_wind_direction_pmtiles``,
-        passend zu ``tile_compression = GZIP`` im PMTiles-Header.
+        anschliessend über das KOMPLETTE Tile in ``_create_wind_direction_tiles``
+        (ein gzip-Strom pro Datei).
 
         Wird ``stats`` (dict) übergeben, wird die Teilzeit aufaddiert:
         "prep" = Quantisierung + Differenz.
@@ -419,29 +440,36 @@ class HrrrWindProcessor:
             stats["prep"] = stats.get("prep", 0.0) + (time.perf_counter() - _t0)
         return raw
 
-    def _create_wind_direction_pmtiles(
+    def _create_wind_direction_tiles(
         self,
         u_raw,
         v_raw,
-        output_pmtiles_path,
+        output_dir,
         min_zoom=0,
-        max_zoom=PMTILES_MAX_ZOOM,
-        finest_stride=PMTILES_FINEST_STRIDE,
+        max_zoom=TILE_MAX_ZOOM,
+        finest_stride=TILE_FINEST_STRIDE,
     ):
-        """Erzeugt PMTiles, deren Kacheln je einen U- und V-Stream enthalten.
+        """Schreibt je Zoomstufe/Kachel eine eigene, bereits gzip-komprimierte Datei.
 
-        Kachel-Aufbau VOR der gzip-Komprimierung:
-            [Geo-Header 24B][u_len 4B][v_len 4B][u_int16_delta][v_int16_delta]
+        Layout relativ zu ``output_dir``::
 
-        Das komplette Tile wird als EIN gzip-Strom abgelegt; der PMTiles-Header
-        deklariert daher ``tile_compression = GZIP`` (gilt fuer das ganze Tile).
+            <z>/<x>/<y>.<TILE_FILE_EXT>
+
+        z.B. ``output/tiles/20261008_2000Z/7/20/51.bin``.
+
+        Der Dateiinhalt ist exakt der bisherige PMTiles-Tile-Payload, nur ohne
+        Container: ``[Geo-Header 24B][u_len 4B][v_len 4B][u_int16][v_int16]``,
+        als EIN gzip-Strom. Weil das gzip nicht vom Webserver nachtraeglich
+        angewendet wird, muss der Host ``Content-Encoding: gzip`` setzen
+        (Cloudflare Pages: ``_headers``). Danach entpackt der Browser transparent
+        und ``response.arrayBuffer()`` liefert wieder die rohen Tile-Bytes.
 
         Als Gitter dient das reguläre Lat/Lon-Zwischengitter. Es wird bis ``max_zoom``
         pyramidal abgelegt. ``finest_stride`` ist der Abtastschritt auf der feinsten
         Stufe: 1 = volle Auflösung (0,025°, kein Detailverlust), 2 = halbe Auflösung
         (0,05°, 4x kleiner, dafür sichtbar unschärfer).
 
-        Jede Kachel bekommt ``PMTILES_TILE_PADDING`` Zellen Halo auf allen 4 Seiten
+        Jede Kachel bekommt ``TILE_PADDING`` Zellen Halo auf allen 4 Seiten
         (siehe Konstante), damit der Client an den Kachelrändern einen äußeren
         Stützpunkt für die lineare Interpolation hat.
         """
@@ -450,15 +478,23 @@ class HrrrWindProcessor:
         lats = self.src_lats
         lons = self.src_lons
 
-        tiles_dict = {}
+        # Ein evtl. vorhandenes Set desselben Timesteps komplett ersetzen, damit
+        # keine veralteten Kacheln liegen bleiben (z.B. aus einer frueheren
+        # Zoom-Konfiguration mit max_zoom = 8).
+        if os.path.isdir(output_dir):
+            shutil.rmtree(output_dir)
+
         total_payload_bytes = 0
+        max_tile_bytes = 0
 
         # Zeitmessung und Zähler
         t_tiles_start = time.perf_counter()
         t_encode = 0.0
+        t_write = 0.0
         enc_stats = {}
         tiles_considered = 0
         tiles_skipped = 0
+        tiles_written = 0
 
         # Schleife über Web-Mercator Kacheln je Zoomstufe
         for z in range(min_zoom, max_zoom + 1):
@@ -491,18 +527,18 @@ class HrrrWindProcessor:
                     # Teilbereich ausschneiden, mit Halo auf allen 4 Seiten.
                     # Das Padding gibt dem Client an den Kachelrändern genug
                     # Stützpunkte für die lineare Interpolation.
-                    c_start = max(0, col_indices[0] - PMTILES_TILE_PADDING)
+                    c_start = max(0, col_indices[0] - TILE_PADDING)
                     c_end = min(
                         len(lons_lod),
-                        col_indices[-1] + 1 + PMTILES_TILE_PADDING,
+                        col_indices[-1] + 1 + TILE_PADDING,
                     )
 
                     # lats_lod ist Süd->Nord sortiert: row_indices[0] = Südrand,
                     # row_indices[-1] = Nordrand. (Lat-Indizes für North-Up)
-                    r_end_idx = max(0, row_indices[0] - PMTILES_TILE_PADDING)
+                    r_end_idx = max(0, row_indices[0] - TILE_PADDING)
                     r_start_idx = min(
                         len(lats_lod) - 1,
-                        row_indices[-1] + PMTILES_TILE_PADDING,
+                        row_indices[-1] + TILE_PADDING,
                     )
 
                     sub_u = u_lod[r_end_idx:r_start_idx + 1, c_start:c_end]
@@ -559,7 +595,8 @@ class HrrrWindProcessor:
                         + v_stream
                     )
 
-                    # Ganz-Tile-gzip -> passt zu tile_compression = GZIP im Header.
+                    # Ganz-Tile-gzip -> die Datei ist ein gzip-Container, der Host
+                    # liefert sie mit Content-Encoding: gzip aus (siehe _headers).
                     # mtime=0 -> reproduzierbare Bytes (kein Zeitstempel im Header)
                     _t_gz = time.perf_counter()
                     tile_bytes = gzip.compress(
@@ -571,60 +608,32 @@ class HrrrWindProcessor:
 
                     t_encode += time.perf_counter() - _t_enc
 
-                    tiles_dict[zxy_to_tileid(z, x, y)] = tile_bytes
+                    # 3. Datei schreiben: <output_dir>/<z>/<x>/<y>.<ext>
+                    tile_dir = os.path.join(output_dir, str(z), str(x))
+                    tile_path = os.path.join(tile_dir, f"{y}.{TILE_FILE_EXT}")
+                    _t_wr = time.perf_counter()
+                    os.makedirs(tile_dir, exist_ok=True)
+                    with open(tile_path, "wb") as fh:
+                        fh.write(tile_bytes)
+                    t_write += time.perf_counter() - _t_wr
+
                     total_payload_bytes += len(tile_bytes)
+                    max_tile_bytes = max(max_tile_bytes, len(tile_bytes))
+                    tiles_written += 1
 
         t_tiles = time.perf_counter() - t_tiles_start
-
-        # PMTiles schreiben
-        t_write_start = time.perf_counter()
-        with open(output_pmtiles_path, "wb") as f:
-            writer = Writer(f)
-
-            for tile_id in sorted(tiles_dict.keys()):
-                writer.write_tile(tile_id, tiles_dict[tile_id])
-
-            header = {
-                "tile_type": TileType.UNKNOWN,
-                # Das ganze Tile ist gzip-komprimiert (siehe tile_bytes-Erzeugung)
-                "tile_compression": Compression.GZIP,
-                "min_zoom": min_zoom,
-                "max_zoom": max_zoom,
-                "min_lon": self.lon_min,
-                "min_lat": self.lat_min,
-                "max_lon": self.lon_max,
-                "max_lat": self.lat_max,
-                "center_zoom": 5,
-                "center_lon": (self.lon_min + self.lon_max) / 2.0,
-                "center_lat": (self.lat_min + self.lat_max) / 2.0
-            }
-
-            metadata = {
-                "name": "HRRR Wind Vector PMTiles (int16-Delta + Ganz-Tile-gzip)",
-                "format": "binary",
-                "description": (
-                    "Komplettes Tile gzip-komprimiert (tile_compression = GZIP). "
-                    "Inhalt unkomprimiert: 24 Byte Geo-Header (6x float32) + 2x "
-                    "uint32 Laenge + je ein int16-Delta-Stream (zeilenweise, erste "
-                    "Spalte je Zeile absolut) fuer U und V. "
-                    f"gzip L{PRED_GZIP_LEVEL}. Skala {PRED_SCALE} m/s, Sentinel "
-                    f"{PRED_SENTINEL}, gueltig bis +-{PRED_VALID_MAX * PRED_SCALE:.0f} m/s."
-                ),
-            }
-
-            writer.finalize(header, metadata)
-
-        t_write = time.perf_counter() - t_write_start
-
-        file_size_kb = os.path.getsize(output_pmtiles_path) / 1024.0
-        print(f"✅ PMTiles Container erfolgreich erstellt: {output_pmtiles_path}")
-        print(f"💾 Gesamtgröße: {file_size_kb:.2f} KB")
-        print(
-            f"   📦 Tile-Payload (gzip, ganzes Tile): "
-            f"{total_payload_bytes / 1048576.0:.2f} MiB "
-            f"in {len(tiles_dict)} Kacheln (L{PRED_GZIP_LEVEL})"
+        file_size_kb = total_payload_bytes / 1024.0
+        per_tile_kb = (
+            total_payload_bytes / tiles_written / 1024.0 if tiles_written else 0.0
         )
-        per_tile_ms = (t_encode / len(tiles_dict) * 1000.0) if tiles_dict else 0.0
+        per_tile_ms = (t_encode / tiles_written * 1000.0) if tiles_written else 0.0
+
+        print(f"✅ {tiles_written} Tile-Dateien geschrieben: {output_dir}")
+        print(
+            f"   📦 Payload (gzip, ganzes Tile): {total_payload_bytes / 1048576.0:.2f} MiB "
+            f"in {tiles_written} Kacheln (L{PRED_GZIP_LEVEL}) | "
+            f"Ø {per_tile_kb:.1f} KiB, max {max_tile_bytes / 1024.0:.1f} KiB"
+        )
         print(
             f"   ⏱️  Tiles: {t_tiles:.3f}s = Fenster/Slice "
             f"{t_tiles - t_encode:.3f}s + Encode {t_encode:.3f}s | "
@@ -636,24 +645,78 @@ class HrrrWindProcessor:
             f"{enc_stats.get('codec', 0.0):.3f}s"
         )
         print(
-            f"      Kacheln: {len(tiles_dict)} geschrieben | {tiles_skipped} leer "
+            f"      Kacheln: {tiles_written} geschrieben | {tiles_skipped} leer "
             f"übersprungen | {tiles_considered} im Gebiet | Ø {per_tile_ms:.2f} ms/Kachel"
         )
 
-        self.last_pmtiles_stats = {
+        self.last_tile_stats = {
             "tiles": t_tiles,
             "window": t_tiles - t_encode,
             "encode": t_encode,
             "write": t_write,
             "encode_prep": enc_stats.get("prep", 0.0),
             "encode_codec": enc_stats.get("codec", 0.0),
-            "tiles_written": len(tiles_dict),
+            "tiles_written": tiles_written,
             "tiles_skipped": tiles_skipped,
             "tiles_considered": tiles_considered,
             "payload_bytes": total_payload_bytes,
             "file_size_kb": file_size_kb,
         }
         return True
+
+    def _write_meta_json(self, output_filename, tiles_dir):
+        """Schreibt die Format-/Gitter-Beschreibung eines Timesteps als JSON.
+
+        Ersetzt den Metadata-Block, den vorher der PMTiles-Container mitgeliefert
+        hat. Liegt bewusst NICHT unter ``/tiles/``, weil dort alles als gzip
+        ausgeliefert wird (siehe _headers). Liefert den geschriebenen Pfad zurück.
+        """
+        meta_dir = os.path.join(self.output_folder, META_SUBDIR)
+        os.makedirs(meta_dir, exist_ok=True)
+        meta_path = os.path.join(meta_dir, f"{output_filename}.json")
+
+        meta = {
+            "timestamp": output_filename,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "format": {
+                "id": "hrrr-wind-int16-delta",
+                "version": 1,
+                "tile_url": (
+                    f"/{TILES_SUBDIR}/{output_filename}/"
+                    f"{{z}}/{{x}}/{{y}}.{TILE_FILE_EXT}"
+                ),
+                "encoding": "gzip",
+                "layout": (
+                    "24B Geo-Header (6x float32 LE: origin_lng, origin_lat, "
+                    "delta_lng, delta_lat, rows, cols) + 2x uint32 LE (u_len, "
+                    "v_len in Bytes) + u_int16 LE + v_int16 LE. Beide Streams "
+                    "row-major, North-Up (Zeile 0 = Nordrand) und pro Zeile "
+                    "delta-kodiert; Spalte 0 jeder Zeile ist der absolute Anker."
+                ),
+                "scale": PRED_SCALE,
+                "unit": "m/s",
+                "sentinel": PRED_SENTINEL,
+                "valid_max": PRED_VALID_MAX,
+            },
+            "pyramid": {
+                "min_zoom": 0,
+                "max_zoom": TILE_MAX_ZOOM,
+                "finest_stride": TILE_FINEST_STRIDE,
+                "padding_cells": TILE_PADDING,
+                "resolution_deg": self.src_resolution,
+                "tile_set": os.path.basename(tiles_dir),
+            },
+            "bounds": {
+                "west": self.lon_min,
+                "south": self.lat_min,
+                "east": self.lon_max,
+                "north": self.lat_max,
+            },
+        }
+
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        return meta_path
 
     def _print_step_timings(self, step_duration):
         """Gibt die gemessenen Zeitanteile eines Timesteps als kleine Tabelle aus."""
@@ -674,7 +737,7 @@ class HrrrWindProcessor:
     def process_om_file(self, om_path, output_filename=None):
         step_start_time = time.perf_counter()
         self.last_step_timings = {}
-        self.last_pmtiles_stats = {}
+        self.last_tile_stats = {}
         _t_mark = step_start_time
 
         def _lap(name):
@@ -706,14 +769,14 @@ class HrrrWindProcessor:
         _lap("read")
 
         # --- B. HRRR liegt in Lambert-Conformal-Projektion vor -> auf das reguläre
-        # Lat/Lon-Zwischengitter resampeln (Open-Meteo/PMTiles-kompatibles Format)
+        # Lat/Lon-Zwischengitter resampeln (Open-Meteo-kompatibles Format)
         u_grid, v_grid, valid_mask = self._resample_to_regular_grid(u_raw, v_raw)
         _lap("resample")
 
         # --- NUR FUER DAS FELD-WEBP (auskommentiert) ---------------------------------
         # Farbcodiertes Windgeschwindigkeits-Overlay: Windgeschwindigkeit berechnen,
         # auf das Mercator-Zielgitter ziehen, in 13 Farbstufen quantisieren und als
-        # verlustfreies WebP speichern. Fuer die PMTiles nicht noetig.
+        # verlustfreies WebP speichern. Fuer die Tiles nicht noetig.
         #
         # # --- C. Feldbild (Windgeschwindigkeit in Knoten, farbcodiert) rendern ---
         # u_clean = np.nan_to_num(u_grid, nan=0.0)
@@ -752,13 +815,14 @@ class HrrrWindProcessor:
         # _lap("webp_save")
         # --- ENDE NUR FUER DAS FELD-WEBP --------------------------------------------
 
-        # --- E. PMTiles (Vektorkacheln mit u/v für die Pfeil-Darstellung) ---
-        # output_filename traegt nur den Zeitstempel ("...Z") als Namensbasis;
-        # das Feld-WebP wird nicht mehr geschrieben, es entsteht nur die PMTiles.
-        pmtiles_filename = f"{output_filename}_dir.pmtiles"
-        output_pmtiles_path = os.path.join(self.output_folder, pmtiles_filename)
-        success_pmtiles = self._create_wind_direction_pmtiles(u_grid, v_grid, output_pmtiles_path)
-        _lap("pmtiles")
+        # --- E. Tiles (einzelne gzip-Dateien pro Kachel, Tileserver-Layout) ---
+        # output_filename traegt nur den Zeitstempel ("...Z") als Namensbasis.
+        # Ergebnis: <output>/tiles/<timestamp>/<z>/<x>/<y>.bin + <output>/meta/<timestamp>.json
+        tiles_dir = os.path.join(self.output_folder, TILES_SUBDIR, output_filename)
+        success_tiles = self._create_wind_direction_tiles(u_grid, v_grid, tiles_dir)
+        if os.path.isdir(tiles_dir):
+            self._write_meta_json(output_filename, tiles_dir)
+        _lap("tiles")
 
         if os.path.exists(om_path):
             os.remove(om_path)
@@ -768,6 +832,15 @@ class HrrrWindProcessor:
         print(f"    ⏱️ Dauer: {step_duration:.3f}s")
         self._print_step_timings(step_duration)
 
-        pmtiles_kb = os.path.getsize(output_pmtiles_path) / 1024.0 if os.path.exists(output_pmtiles_path) else 0.0
-        print(f"    📁 PMTiles {pmtiles_kb:.1f} KB")
-        return success_pmtiles
+        tile_files = 0
+        tile_bytes_total = 0
+        if os.path.isdir(tiles_dir):
+            for root_dir, _subdirs, filenames in os.walk(tiles_dir):
+                for name in filenames:
+                    tile_files += 1
+                    tile_bytes_total += os.path.getsize(os.path.join(root_dir, name))
+        print(
+            f"    📁 Tiles {tile_files} Dateien, "
+            f"{tile_bytes_total / 1048576.0:.2f} MiB -> {tiles_dir}"
+        )
+        return success_tiles
