@@ -133,10 +133,13 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 #
 #     Level 0..max_zoom,   stride = finest_stride * 2^(max_zoom - z)
 #
-# PMTILES_MAX_ZOOM = 7 passt zu 512-px-Kacheln im Frontend: deck.gl liest dann pro
-# Kamerazoomstufe eine Stufe gröber (z = round(cameraZoom) - 1), Level 8 wird also
-# nicht mehr gebraucht. Das reduziert die Kachel-/Request-Anzahl (4x weniger Kacheln
-# und damit 4x weniger Encode-Aufrufe), ändert aber die Bytes NICHT.
+# PMTILES_MAX_ZOOM = 7 -> 8 Zoomstufen (0..7). Die feinste Stufe (z = 7) liegt bei
+# stride = 1, also weiterhin auf voller Auflösung (0,025°). Gegenüber max_zoom = 8
+# bedeutet das: eine Stufe weniger, dafür deckt jede Kachel 2x2 Kacheln der alten
+# feinsten Stufe ab -> 4x mehr Zellen (und damit ~4x mehr Bytes) pro Kachel und 4x
+# weniger Kacheln/Requests auf der feinsten Stufe. Die Gesamtdatenmenge bleibt gleich.
+# Das passt zu 512-px-Kacheln im Frontend: deck.gl liest pro Kamerazoomstufe eine
+# Stufe gröber (z = round(cameraZoom) - 1).
 #
 # Die Bytes hängen allein an PMTILES_FINEST_STRIDE (Abtastschritt der feinsten Stufe)
 # und skalieren mit dessen Quadrat:
@@ -146,7 +149,7 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 #
 # Das native HRRR-Raster ist 3 km = ~0,027°: 0,025° überabtastet es also noch,
 # 0,05° unterabtastet es um ~1,85x. finest_stride = 2 ist daher ECHTER Detailverlust.
-PMTILES_MAX_ZOOM = 8
+PMTILES_MAX_ZOOM = 7
 PMTILES_FINEST_STRIDE = 1
 
 # Jede Kachel bekommt PMTILES_TILE_PADDING Zellen Halo auf allen 4 Seiten.
