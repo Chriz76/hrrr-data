@@ -45,8 +45,8 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # Beides aus dem Access-Tab: https://storage.bunnycdn.com/gdsfgdsgdsfd
-      BUNNY_STORAGE_ZONE: gdsfgdsgdsfd
+      # Beides aus dem Access-Tab: https://storage.bunnycdn.com/gdsfgfsdgsfd
+      BUNNY_STORAGE_ZONE: gdsfgfsdgsfd
       # Erstes Feld unter "Access Key" – nicht "Read-only password".
       BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
       FILE_COUNT: ${{ inputs.file_count }}
