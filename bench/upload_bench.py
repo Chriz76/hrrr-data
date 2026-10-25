@@ -32,6 +32,11 @@ import aiohttp
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
+def log(message: str = "") -> None:
+    """Meldungen nach stderr – stdout ist fuer die Job-Summary reserviert."""
+    print(message, file=sys.stderr)
+
+
 async def upload_one(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
@@ -117,7 +122,7 @@ def main() -> int:
         default=os.environ.get("BUNNY_ENDPOINT", "https://storage.bunnycdn.com"),
         help="Regions-Endpoint der Zone, z.B. https://ny.storage.bunnycdn.com",
     )
-    parser.add_argument("--concurrency", type=int, default=48)
+    parser.add_argument("--concurrency", type=int, default=64)
     parser.add_argument("--max-attempts", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
@@ -125,20 +130,18 @@ def main() -> int:
     if not args.zone or not args.password:
         parser.error("--zone/--password (oder BUNNY_STORAGE_ZONE/BUNNY_STORAGE_PASSWORD) fehlen")
 
+    # Secrets aus GitHub Actions schleppen gern ein Leerzeichen/Newline mit –
+    # ein Header mit Whitespace ergibt 401.
+    if args.zone != args.zone.strip() or args.password != args.password.strip():
+        log("  Hinweis: Leerzeichen am Rand von Zone/Passwort entfernt.")
+    args.zone = args.zone.strip()
+    args.password = args.password.strip()
+    args.endpoint = (args.endpoint or "").strip() or "https://storage.bunnycdn.com"
+
     root = Path(args.dir).resolve()
     files = sorted(p for p in root.rglob("*") if p.is_file())
     if not files:
         parser.error(f"keine Dateien in {root}")
-
-    prefix = args.prefix.strip("/")
-    # Ein Aufruf, ein Basis-URL: {endpoint}/{zone}/{prefix}
-    base_url = f"{args.endpoint.rstrip('/')}/{args.zone}/{prefix}"
-
-    print(
-        f"PUT {len(files)} Dateien -> {base_url} "
-        f"(concurrency={args.concurrency})",
-        file=sys.stderr,
-    )
 
     # Auth fuer die HTTP-API: Storage-Zone-Passwort als AccessKey
     # (nicht der Account-API-Key, der gilt nur fuer api.bunny.net).
@@ -146,11 +149,18 @@ def main() -> int:
         "AccessKey": args.password,
         "Content-Type": "application/octet-stream",
     }
-    asyncio.run(_amain(args, files, root, base_url, headers))
+    asyncio.run(_amain(args, files, root, headers))
     return 0
 
 
-async def _amain(args, files, root, base_url, headers):
+async def _amain(args, files, root, headers):
+    base_url = f"{args.endpoint.rstrip('/')}/{args.zone}/{args.prefix.strip('/')}"
+
+    log(
+        f"PUT {len(files)} Dateien -> {base_url} "
+        f"(concurrency={args.concurrency})"
+    )
+
     result = await run(
         files, base_url, args.concurrency, args.max_attempts, args.timeout,
         root, headers,
@@ -158,11 +168,19 @@ async def _amain(args, files, root, base_url, headers):
 
     mib = result["bytes"] / 1048576
     secs = result["seconds"]
+    failed = len(result["errors"])
     print(f"- Dateien: {result['files']} ({mib:.0f} MiB)")
     print(f"- Dauer: {secs:.1f} s")
-    print(f"- Rate: {result['files'] / secs:.0f} Dateien/s, {mib / secs:.1f} MiB/s")
+    if failed == result["files"]:
+        print("- **Alle Uploads fehlgeschlagen – Kennzahlen unbrauchbar**")
+    else:
+        print(f"- Rate: {result['files'] / secs:.0f} Dateien/s, {mib / secs:.1f} MiB/s")
     print(f"- Parallelitaet: {result['concurrency']}")
-    print(f"- Fehler: {len(result['errors'])}")
+    print(f"- Fehler: {failed}")
+    if result["errors"]:
+        for err in result["errors"][:5]:
+            log(f"  FEHLER: {err}")
+        sys.exit(1)
     if result["errors"]:
         for err in result["errors"][:10]:
             print(f"  FEHLER: {err}", file=sys.stderr)

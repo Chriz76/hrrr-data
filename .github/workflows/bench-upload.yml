@@ -34,9 +34,8 @@ permissions:
   contents: read
 
 env:
-  # Regions-Endpoint der Zone: DE = storage.bunnycdn.com,
-  # sonst uk./ny./la./sg./se./br./jh./syd. – repo-weit als Variable pflegen.
-  BUNNY_ENDPOINT: ${{ vars.BUNNY_ENDPOINT || 'https://storage.bunnycdn.com' }}
+  # Fest aus dem Access-Tab der Zone: Frankfurt, DE
+  BUNNY_ENDPOINT: https://storage.bunnycdn.com
   BENCH_ROOT: /tmp/bench
   BENCH_PREFIX: bench/${{ github.run_id }}
 
@@ -46,8 +45,9 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # Zone-Passwort = AccessKey der Storage-HTTP-API (nicht der Account-Key).
-      BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
+      # Beides aus dem Access-Tab: https://storage.bunnycdn.com/gdsfgdsgdsfd
+      BUNNY_STORAGE_ZONE: gdsfgdsgdsfd
+      # Erstes Feld unter "Access Key" – nicht "Read-only password".
       BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
       FILE_COUNT: ${{ inputs.file_count }}
       FILE_SIZE_KB: ${{ inputs.file_size_kb }}
@@ -66,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for name in BUNNY_STORAGE_ZONE BUNNY_STORAGE_PASSWORD; do
+          for name in BUNNY_STORAGE_PASSWORD; do
             value=$(printenv "$name" || true)
             if [ -z "$value" ]; then
               echo "::error::$name fehlt (Repository-Secret anlegen)"
