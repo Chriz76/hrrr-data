@@ -3,3 +3,4 @@ scipy
 requests
 omfiles
 pmtiles
+aiohttp

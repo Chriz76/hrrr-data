@@ -1,4 +1,22 @@
-name: Run Pipeline & Deploy to Cloudflare Pages
+name: Run Pipeline & Upload to Bunny Storage
+
+# Einmalig im Pull Zone (CDN -> dein Pull Zone -> Edge Rules) anzulegen,
+# Action jeweils "Set Response Header":
+#
+#   Trigger *.bin  ->  Content-Encoding: gzip
+#   Trigger *.bin  ->  Cache-Control: no-store, no-transform
+#   Trigger *.json ->  Cache-Control: no-store
+#
+# CORS im Pull Zone aktivieren (Access-Control-Allow-Origin: *).
+#
+# Grund: die Storage-HTTP-API kann keine Response-Header speichern, und die
+# Cloudflare-Datei "_headers" existiert bei Bunny nicht. "no-transform" bleibt
+# Pflicht, solange vor-komprimiert wird - sonst packt der CDN die bereits
+# gzip-komprimierten Kacheln ein zweites Mal ein.
+#
+# Pruefen nach dem ersten Deploy:
+#   curl -sI https://<pullzone-host>/tiles/<ts>/7/20/51.bin
+#   -> content-encoding: gzip
 
 on:
   workflow_dispatch:
@@ -15,18 +33,24 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Fest aus dem Access-Tab der Zone (Frankfurt, DE).
+  BUNNY_ENDPOINT: https://storage.bunnycdn.com
+  BUNNY_STORAGE_ZONE: gdsfgfsdgsfd
+  # Die Pipeline schreibt direkt in den Deploy-Ordner.
+  OUTPUT_DIR: ./t
+  # Bunny hat kein Dateilimit wie Cloudflare Pages (20k) -> voller Horizont
+  # (~37 Zeitstempel). Fuer den alten 30er-Deckel hier wieder '30' eintragen.
+  MAX_TILE_DIRS: '40'
+  # 48 parallele PUTs; mehr als ~100 gleichzeitige Verbindungen pro IP gibt 429.
+  UPLOAD_CONCURRENCY: '48'
+  # Loeschen: max. 30 gleichzeitige DELETEs pro Zone/Server erlaubt.
+  DELETE_CONCURRENCY: '12'
+
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-
-    env:
-      # Die Pipeline schreibt direkt in den Deploy-Ordner (OUTPUT_DIR ist in
-      # pipeline.py per Env überschreibbar, Default "./output").
-      OUTPUT_DIR: ./t
-      # Max. Tile-Sets (= Zeitstempel) pro Deployment. Cloudflare Pages erlaubt
-      # 20.000 Dateien (Free) bzw. 100.000 Dateien (bezahlte Pläne, wrangler v4).
-      # Budget: 30 x ~613 Kacheln + 30 Metadaten + index.json/_headers ≈ 18.4k.
-      MAX_TILE_DIRS: '30'
+    timeout-minutes: 90
 
     steps:
       - name: Checkout Code
@@ -37,6 +61,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
 
       - name: Install Python dependencies
         run: |
@@ -48,19 +73,47 @@ jobs:
           TARGET_RUN: ${{ github.event.inputs.run }}
         run: python pipeline/src/pipeline.py
 
-      - name: Dateilimit prüfen (Cloudflare Pages)
+      - name: Output pruefen
         run: |
-          COUNT=$(find t -type f | wc -l)
-          echo "Dateien im Deploy-Ordner t/: $COUNT"
-          if [ "$COUNT" -gt 19900 ]; then
-            echo "::error::$COUNT Dateien überschreiten das Cloudflare-Pages-Limit (Free: 20.000). MAX_TILE_DIRS reduzieren oder bezahlter Plan + PAGES_WRANGLER_MAJOR_VERSION=4 (100.000 Dateien) verwenden."
+          set -euo pipefail
+          if [ ! -f "$OUTPUT_DIR/index.json" ]; then
+            echo "::error::$OUTPUT_DIR/index.json fehlt - die Pipeline hat nichts erzeugt"
             exit 1
           fi
+          echo "Tile-Sets: $(find "$OUTPUT_DIR/tiles" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          echo "Dateien:   $(find "$OUTPUT_DIR" -type f | wc -l)"
+          echo "Volumen:   $(du -sh "$OUTPUT_DIR" | cut -f1)"
 
-      - name: wrangler deploy ausführen
+      - name: Upload nach Bunny Storage
         env:
-          # Falls das Secret noch "NETLIFY_AUTH_TOKEN" heißt, wird es als Fallback genutzt.
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.NETLIFY_AUTH_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: c728452fcd5090f3d7f2bacc5e75fcd2
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
         run: |
-          time npx --yes wrangler@latest pages deploy t --project-name winddata --commit-dirty=true
+          python pipeline/src/upload_bunny.py \
+            --dir "$OUTPUT_DIR" \
+            --concurrency "$UPLOAD_CONCURRENCY" \
+            --delete-concurrency "$DELETE_CONCURRENCY" \
+            --prune
+
+      # Optional: braucht die Repository-Variable BUNNY_PULLZONE_HOST
+      # (z.B. winddata.b-cdn.net) und das Secret BUNNYNET_API_KEY.
+      # Die Kacheln liegen unter neuen Zeitstempel-Pfaden (Cache-Miss), nur
+      # der Index aendert sich pro Lauf und muss aus dem Cache.
+      - name: index.json im CDN-Cache verwerfen
+        if: vars.BUNNY_PULLZONE_HOST != ''
+        env:
+          BUNNYNET_API_KEY: ${{ secrets.BUNNYNET_API_KEY }}
+          HOST: ${{ vars.BUNNY_PULLZONE_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BUNNYNET_API_KEY:-}" ]; then
+            echo "::warning::BUNNYNET_API_KEY fehlt - Cache-Purge uebersprungen"
+            exit 0
+          fi
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -G \
+            -H "AccessKey: $BUNNYNET_API_KEY" \
+            --data-urlencode "url=https://$HOST/index.json" \
+            "https://api.bunny.net/purge")
+          echo "Purge https://$HOST/index.json -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::Purge lieferte HTTP $code"
+          fi
