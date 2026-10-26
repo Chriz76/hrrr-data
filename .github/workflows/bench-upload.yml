@@ -1,0 +1,127 @@
+name: "Benchmark: Bunny Storage Upload"
+
+# Schnellster Upload-Weg: parallele HTTP-PUTs (aiohttp, Keep-alive, Backoff
+# nur auf 429/5xx). Ein PUT pro Datei – die Bunny-API kennt weder Batch-Upload
+# noch serverseitiges Entpacken, also ist Parallelitaet der einzige Hebel.
+#
+# Alle Dateien landen unter einem eigenen Praefix bench/<run_id>/ und werden
+# am Ende rekursiv geloescht – Produktivdaten bleiben unberuehrt.
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_count:
+        description: 'Anzahl Testdateien'
+        required: false
+        default: '15000'
+        type: string
+      file_size_kb:
+        description: 'Groesse pro Datei in KiB'
+        required: false
+        default: '20'
+        type: string
+      concurrency:
+        description: 'Parallele PUTs (Optimum ~48-64; ueber 100 gibt 429 wegen IP-Limit)'
+        required: false
+        default: '64'
+        type: string
+
+concurrency:
+  group: bench-upload
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Fest aus dem Access-Tab der Zone: Frankfurt, DE
+  BUNNY_ENDPOINT: https://storage.bunnycdn.com
+  BENCH_ROOT: /tmp/bench
+  BENCH_PREFIX: bench/${{ github.run_id }}
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # Beides aus dem Access-Tab: https://storage.bunnycdn.com/gdsfgfsdgsfd
+      BUNNY_STORAGE_ZONE: gdsfgfsdgsfd
+      # Erstes Feld unter "Access Key" – nicht "Read-only password".
+      BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+      FILE_COUNT: ${{ inputs.file_count }}
+      FILE_SIZE_KB: ${{ inputs.file_size_kb }}
+      CONCURRENCY: ${{ inputs.concurrency }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Preflight (Secrets pruefen)
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in BUNNY_STORAGE_PASSWORD; do
+            value=$(printenv "$name" || true)
+            if [ -z "$value" ]; then
+              echo "::error::$name fehlt (Repository-Secret anlegen)"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Testdateien erzeugen
+        run: |
+          set -euo pipefail
+          mkdir -p "$BENCH_ROOT"
+          python3 - <<'PY'
+          import os, pathlib
+
+          count = int(os.environ["FILE_COUNT"])
+          size = int(os.environ["FILE_SIZE_KB"]) * 1024
+          root = pathlib.Path(os.environ["BENCH_ROOT"]) / "t"
+          root.mkdir(parents=True, exist_ok=True)
+
+          # Ein Block, wiederholt geschrieben: spart Entropie/CPU gegenueber
+          # 15.000 x os.urandom, ohne die Groesse zu verfaelschen.
+          block = os.urandom(size)
+          for i in range(count):
+              (root / f"{i:05d}.pbf").write_bytes(block)
+
+          total = sum(p.stat().st_size for p in root.iterdir())
+          print(f"{count} Dateien, {total / 1048576:.1f} MiB in {root}")
+          PY
+
+      - name: aiohttp installieren
+        run: python -m pip install --quiet --no-cache-dir aiohttp
+
+      - name: Upload – parallele HTTP-PUTs
+        run: |
+          set -euo pipefail
+          echo "### Bunny Storage Upload" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 bench/upload_bench.py \
+            --dir "$BENCH_ROOT/t" \
+            --prefix "$BENCH_PREFIX/tiles" \
+            --concurrency "$CONCURRENCY" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------ Cleanup --
+      - name: Aufraeumen (rekursiver DELETE des Bench-Praefix)
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -z "${BUNNY_STORAGE_PASSWORD:-}" ] || [ -z "${BUNNY_STORAGE_ZONE:-}" ]; then
+            echo "Keine Credentials – nichts zu loeschen."
+            exit 0
+          fi
+          # Ein DELETE auf das Verzeichnis loescht rekursiv (kein 15.000er-Loop).
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+            -H "AccessKey: $BUNNY_STORAGE_PASSWORD" \
+            --max-time 300 \
+            "$BUNNY_ENDPOINT/$BUNNY_STORAGE_ZONE/$BENCH_PREFIX/")
+          echo "DELETE $BENCH_PREFIX/ -> HTTP $code"
