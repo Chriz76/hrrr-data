@@ -1,5 +1,13 @@
 name: Run Pipeline & Upload to Bunny Storage
 
+# Layout in der Zone:
+#   runs/<run>/tiles/<ts>/<z>/<x>/<y>.bin   (vor-komprimiert, gzip)
+#   runs/<run>/meta/<ts>.json
+#   index.json                              (Root, zeigt auf runs/<run>/)
+#
+# Ablauf: Run komplett nach runs/<run>/ hochladen, dann index.json im Root
+# umstellen (atomarer Switch), erst danach alte Runs loeschen.
+#
 # Einmalig im Pull Zone (CDN -> dein Pull Zone -> Edge Rules) anzulegen,
 # Action jeweils "Set Response Header":
 #
@@ -45,7 +53,9 @@ env:
   # 48 parallele PUTs; mehr als ~100 gleichzeitige Verbindungen pro IP gibt 429.
   UPLOAD_CONCURRENCY: '48'
   # Loeschen: max. 30 gleichzeitige DELETEs pro Zone/Server erlaubt.
-  DELETE_CONCURRENCY: '12'
+  DELETE_CONCURRENCY: '24'
+  # Vorherige Runs als Rollback-Fenster behalten (0 = nur der aktuelle bleibt).
+  KEEP_RUNS: '1'
 
 jobs:
   pipeline:
@@ -69,6 +79,7 @@ jobs:
           pip install -r pipeline/requirements.txt
 
       - name: Run pipeline
+        id: pipeline
         env:
           TARGET_RUN: ${{ github.event.inputs.run }}
         run: python pipeline/src/pipeline.py
@@ -84,20 +95,28 @@ jobs:
           echo "Dateien:   $(find "$OUTPUT_DIR" -type f | wc -l)"
           echo "Volumen:   $(du -sh "$OUTPUT_DIR" | cut -f1)"
 
+      # Jeder Run landet unter runs/<run>/. Erst wenn der komplette Run oben
+      # ist, wird index.json im Root umgestellt (atomarer Switch); danach
+      # werden aeltere Runs geloescht (KEEP_RUNS bleiben als Rollback).
       - name: Upload nach Bunny Storage
         env:
           BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+          RUN_ID: ${{ steps.pipeline.outputs.run_id }}
         run: |
+          set -euo pipefail
+          : "${RUN_ID:?Run-ID fehlt - die Pipeline hat keine run_id ausgegeben}"
           python pipeline/src/upload_bunny.py \
             --dir "$OUTPUT_DIR" \
+            --run "$RUN_ID" \
+            --keep-runs "$KEEP_RUNS" \
             --concurrency "$UPLOAD_CONCURRENCY" \
             --delete-concurrency "$DELETE_CONCURRENCY" \
             --prune
 
       # Optional: braucht die Repository-Variable BUNNY_PULLZONE_HOST
       # (z.B. winddata.b-cdn.net) und das Secret BUNNYNET_API_KEY.
-      # Die Kacheln liegen unter neuen Zeitstempel-Pfaden (Cache-Miss), nur
-      # der Index aendert sich pro Lauf und muss aus dem Cache.
+      # Die Kacheln liegen unter neuen Run-Pfaden (Cache-Miss), nur der
+      # Index aendert sich pro Lauf und muss aus dem Cache.
       - name: index.json im CDN-Cache verwerfen
         if: vars.BUNNY_PULLZONE_HOST != ''
         env:

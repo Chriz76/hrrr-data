@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""Laedt den Pipeline-Output nach Bunny Storage und raeumt alte Tile-Sets ab.
+"""Laedt einen Pipeline-Run nach Bunny Storage und schaltet index.json um.
 
 Beispiel:
     BUNNY_STORAGE_ZONE=gdsfgfsdgsfd BUNNY_STORAGE_PASSWORD=... \
-        python pipeline/src/upload_bunny.py --dir ./t --prune
+        python pipeline/src/upload_bunny.py --dir ./t --run 20261027_1200 --prune
 
-Abbildung 1:1, die Pfade bleiben wie in index.json deklariert:
+Layout in der Zone:
 
-    tiles/<timestamp>/<z>/<x>/<y>.bin   (vor-komprimiert, gzip)
-    meta/<timestamp>.json
-    index.json
+    runs/<run>/tiles/<timestamp>/<z>/<x>/<y>.bin   (vor-komprimiert, gzip)
+    runs/<run>/meta/<timestamp>.json
+    index.json                                     (Root, zeigt auf runs/<run>/)
 
 Ablauf
-  1. alle Dateien parallel hochladen (index.json zuletzt, damit der Index nie
-     auf noch fehlende Kacheln zeigt)
-  2. mit --prune: Zeitstempel-Verzeichnisse unter tiles/ und deren
-     meta/<ts>.json loeschen, die im aktuellen Lauf nicht vorkommen.
-     Pro altem Set ist das EIN rekursiver DELETE (kein 600er-Loop) und
-     mehrere Sets laufen parallel (Limit: 30 gleichzeitige DELETEs).
-  3. andere Pfade in der Zone (z.B. bench/) werden nie angefasst.
+  1. alle Dateien unter runs/<run>/ hochladen
+  2. index.json zuletzt in den Root -> das ist der atomare Switch. Bis dahin
+     zeigt der alte Index weiter auf den alten, unangetasteten Run.
+  3. mit --prune: Runs loeschen, die nicht zu den letzten --keep-runs gehoeren.
+     Geloescht wird pro Zeitstempel-Verzeichnis parallel; ein einzelner
+     rekursiver DELETE auf einen ganzen Run (~23k Objekte) dauert ~1 Minute.
 
 Nicht hochgeladen wird die Cloudflare-Datei `_headers` – auf Bunny werden die
 Response-Header per Edge Rule im Pull Zone gesetzt.
@@ -160,38 +159,51 @@ async def list_dir(
             return json.loads(await resp.text())
 
 
-async def prune_old_sets(
+async def list_runs(
+    base_url: str, headers: dict[str, str], timeout_s: float
+) -> list[str]:
+    """Alle Run-Ordner unter runs/ (sortiert = chronologisch)."""
+    entries = await list_dir(base_url, "runs", headers, timeout_s)
+    return sorted(
+        entry["ObjectName"] for entry in entries if entry.get("IsDirectory")
+    )
+
+
+async def prune_old_runs(
     base_url: str,
     headers: dict[str, str],
-    keep: set[str],
+    current_run: str,
+    keep_runs: int,
     concurrency: int,
     timeout_s: float,
     attempts: int,
 ) -> tuple[list[str], list[str]]:
-    """Loescht tiles/<ts>/ und meta/<ts>.json, die es lokal nicht mehr gibt."""
-    tiles = await list_dir(base_url, "tiles", headers, timeout_s)
-    stale_dirs = sorted(
-        entry["ObjectName"]
-        for entry in tiles
-        if entry.get("IsDirectory") and entry["ObjectName"] not in keep
-    )
-
-    meta = await list_dir(base_url, "meta", headers, timeout_s)
-    keep_meta = {f"{name}.json" for name in keep}
-    stale_meta = sorted(
-        entry["ObjectName"]
-        for entry in meta
-        if not entry.get("IsDirectory")
-        and entry["ObjectName"].startswith("20")
-        and entry["ObjectName"] not in keep_meta
-    )
-
-    targets = [f"tiles/{name}/" for name in stale_dirs]
-    targets += [f"meta/{name}" for name in stale_meta]
-    if not targets:
+    """Loescht alte Runs; `keep_runs` vorherige bleiben als Rollback-Fenster."""
+    runs = await list_runs(base_url, headers, timeout_s)
+    if current_run not in runs:
+        # Der neue Run ist noch nicht sichtbar -> lieber nichts anfassen.
+        log(f"::warning::Run {current_run} nicht unter runs/ gefunden, kein Aufraeumen")
         return [], []
 
-    log(f"  {len(stale_dirs)} alte Tile-Set(s) + {len(stale_meta)} Metadatei(en) entfernen")
+    older = [name for name in runs if name != current_run]
+    stale = older[:-keep_runs] if keep_runs > 0 else older
+    if not stale:
+        log("  keine alten Runs zu loeschen")
+        return [], []
+
+    log(f"  {len(stale)} alte Run(s) entfernen, {len(older) - len(stale)} bleiben")
+
+    # Pro Run zuerst die Zeitstempel-Verzeichnisse einsammeln: die werden
+    # parallel geloescht, weil ein rekursiver DELETE auf den ganzen Run
+    # (~23k Objekte) gut eine Minute braucht.
+    tile_targets: list[str] = []
+    for run in stale:
+        tiles = await list_dir(base_url, f"runs/{run}/tiles", headers, timeout_s)
+        tile_targets += [
+            f"runs/{run}/tiles/{entry['ObjectName']}/"
+            for entry in tiles
+            if entry.get("IsDirectory")
+        ]
 
     sem = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(limit=concurrency)
@@ -204,18 +216,18 @@ async def prune_old_sets(
         )
         if error:
             errors.append(f"{target} -> {error}")
-        else:
-            log(f"  geloescht: {target}")
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        await asyncio.gather(*(one(target) for target in targets))
-    return targets, errors
+        # Phase 1: Kachel-Verzeichnisse parallel.
+        await asyncio.gather(*(one(target) for target in tile_targets))
+        # Phase 2: pro Run nur noch meta/*.json + leere Verzeichnisse.
+        await asyncio.gather(*(one(f"runs/{run}/") for run in stale))
+    return stale, errors
 
 
-def collect_items(root: Path) -> tuple[list[tuple[Path, str]], set[str]]:
-    """Dateien einsammeln; liefert (Upload-Liste, vorhandene Zeitstempel)."""
+def collect_items(root: Path) -> list[tuple[Path, str]]:
+    """Alle Dateien des Runs einsammeln (ohne Cloudflare-Artefakte)."""
     items: list[tuple[Path, str]] = []
-    keep: set[str] = set()
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -224,11 +236,7 @@ def collect_items(root: Path) -> tuple[list[tuple[Path, str]], set[str]]:
             log(f"  uebersprungen: {rel} (auf Bunny per Edge Rule gesetzt)")
             continue
         items.append((path, rel))
-        parts = rel.split("/")
-        # tiles/<timestamp>/<z>/<x>/<y>.bin -> Zeitstempel fuer das Aufraeumen
-        if parts[0] == "tiles" and len(parts) >= 2:
-            keep.add(parts[1])
-    return items, keep
+    return items
 
 
 def main() -> int:
@@ -242,55 +250,83 @@ def main() -> int:
         help="Regions-Endpoint der Zone (DE: https://storage.bunnycdn.com)",
     )
     parser.add_argument("--concurrency", type=int, default=48)
-    parser.add_argument("--delete-concurrency", type=int, default=12)
+    parser.add_argument("--delete-concurrency", type=int, default=24)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--attempts", type=int, default=5)
     parser.add_argument(
-        "--prune", action="store_true", help="Alte Tile-Sets in der Zone loeschen"
+        "--run",
+        required=True,
+        help="Run-ID, wird zum Ordnernamen unter runs/ (z.B. 20261027_1200)",
+    )
+    parser.add_argument(
+        "--keep-runs",
+        type=int,
+        default=1,
+        help="So viele vorherige Runs als Rollback-Fenster behalten",
+    )
+    parser.add_argument(
+        "--prune", action="store_true", help="Alte Runs in der Zone loeschen"
     )
     args = parser.parse_args()
 
     if not args.zone or not args.password:
         parser.error("--zone/--password (oder BUNNY_STORAGE_ZONE/BUNNY_STORAGE_PASSWORD) fehlen")
 
+    run = args.run.strip().strip("/")
+    if not run:
+        parser.error("--run ist leer")
+    if "/" in run:
+        parser.error("--run darf keine Schraegstriche enthalten")
+
     zone = args.zone.strip()
     base_url = f"{(args.endpoint or '').strip().rstrip('/')}/{zone}"
     headers = {"AccessKey": args.password.strip()}
 
     root = Path(args.dir).resolve()
-    items, keep = collect_items(root)
+    items = collect_items(root)
     if not items:
         parser.error(f"keine Dateien in {root}")
 
-    # index.json zuletzt: der Index darf nie vor seinen Kacheln live sein.
-    index_items = [it for it in items if it[1] == "index.json"]
-    data_items = [it for it in items if it[1] != "index.json"]
+    # Alles unter runs/<run>/, nur index.json geht in den Root.
+    run_prefix = f"runs/{run}"
+    index_items: list[tuple[Path, str]] = []
+    run_items: list[tuple[Path, str]] = []
+    for local, rel in items:
+        if rel == "index.json":
+            index_items.append((local, "index.json"))
+        else:
+            run_items.append((local, f"{run_prefix}/{rel}"))
     total_bytes = sum(p.stat().st_size for p, _ in items)
 
     log(
         f"Upload {len(items)} Dateien ({total_bytes / 1048576:.1f} MiB) "
-        f"-> {base_url}/  (concurrency={args.concurrency})"
+        f"-> {base_url}/{run_prefix}/  (concurrency={args.concurrency})"
     )
 
     started = time.perf_counter()
     errors = asyncio.run(
-        upload_items(data_items, base_url, headers, args.concurrency,
+        upload_items(run_items, base_url, headers, args.concurrency,
                      args.timeout, args.attempts)
     )
-    errors += asyncio.run(
-        upload_items(index_items, base_url, headers, args.concurrency,
-                     args.timeout, args.attempts)
-    )
+
+    # Atomarer Switch: index.json erst, wenn der komplette Run oben ist.
+    if errors:
+        log(f"  {len(errors)} Fehler -> index.json bleibt unveraendert")
+    else:
+        errors += asyncio.run(
+            upload_items(index_items, base_url, headers, 1,
+                         args.timeout, args.attempts)
+        )
     elapsed = time.perf_counter() - started
 
     deleted: list[str] = []
-    # Erst aufraeumen, wenn alles angekommen ist – sonst zeigt der neue Index
-    # auf Kacheln, die schon geloescht wurden.
+    # Aufraeumen erst, wenn der neue Index live ist – sonst wuerde der alte
+    # Index auf geloeschte Daten zeigen.
     if args.prune and not errors:
         try:
             deleted, prune_errors = asyncio.run(
-                prune_old_sets(base_url, headers, keep, args.delete_concurrency,
-                               args.timeout, args.attempts)
+                prune_old_runs(base_url, headers, run, args.keep_runs,
+                               args.delete_concurrency, args.timeout, args.attempts)
             )
             errors += prune_errors
         except RuntimeError as exc:
@@ -298,10 +334,12 @@ def main() -> int:
             log("  Aufraeumen uebersprungen.")
 
     print(
-        f"- Dateien: {len(items)} ({total_bytes / 1048576:.1f} MiB) "
-        f"in {elapsed:.1f} s ({len(items) / elapsed:.0f}/s)"
+        f"- Run: {run} ({len(items)} Dateien, {total_bytes / 1048576:.1f} MiB "
+        f"in {elapsed:.1f} s)"
     )
-    print(f"- Alte Sets entfernt: {len(deleted)}")
+    print(f"- Alte Runs entfernt: {len(deleted)}")
+    switched = "ja" if (not errors and index_items) else "nein"
+    print(f"- index.json umgestellt: {switched}")
     print(f"- Fehler: {len(errors)}")
 
     if errors:

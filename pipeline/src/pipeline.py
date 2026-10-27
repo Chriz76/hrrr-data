@@ -37,23 +37,18 @@ META_DIR_NAME = "meta"
 
 # Maximal zu behaltende Tile-Sets (ein Set = ein Zeitstempel = tiles/<ts>/...).
 #
-# Cloudflare-Pages-Limit: 20.000 Dateien (Free) bzw. 100.000 Dateien (bezahlte
-# Pläne, dafür PAGES_WRANGLER_MAJOR_VERSION=4 setzen).
+# Kein Host-Dateilimit mehr (Bunny Storage): ein voller Run liefert aktuell
+# ~37 Zeitstempel (25 x 15-min bis +6h, dann 12 stuendliche bis +18h).
+# MAX_TILE_DIRS >= 37 behaelt den kompletten Horizont; ein kleinerer Wert
+# schneidet die FERNSTEN Prognosestunden ab (bei 30 endet der Horizont bei
+# ~+11h statt +18h).
 #
-# Budget bei 30 Sets:
-#     30 x ~613 Kacheln      = ~18.390 Dateien
-#     + 30 meta/*.json       =      30
-#     + index.json + _headers=       2
-#     ------------------------------- ~18.422 Dateien < 20.000  -> passt (Free).
+# Budget bei 37 Sets: ~37 x 613 Kacheln = ~22.700 Dateien
+#                     + 37 meta/*.json + index.json
 #
-# Bei 40 Sets wären es ~24.520 Dateien -> über dem Free-Limit. Wer mehr braucht:
-# bezahlter Plan (100k) oder R2 + Worker (kein Dateilimit).
-#
-# Ein voller Run liefert aktuell ~37 Zeitstempel (25 x 15-min bis +6h, dann 12
-# stündliche bis +18h). Da es keinen gh-pages-Checkout mehr gibt, enthält der
-# Deploy-Ordner genau diesen Run -> bei 30 werden die 7 FERNSTEN abgeschnitten
-# (Horizont endet dann bei ~+11h statt +18h). Voller Horizont = MAX_TILE_DIRS
-# auf 40 setzen UND einen bezahlten Plan (100k Dateien) verwenden.
+# Der Deploy-Ordner enthaelt immer nur den aktuellen Run (kein Cross-Run-
+# Wiederverwenden). Das Entfernen alter Sets in der Zone uebernimmt
+# upload_bunny.py mit --prune.
 MAX_TILE_DIRS = int(os.environ.get("MAX_TILE_DIRS", "30"))
 # Auskommentiert: das Feld-WebP entfaellt, es gibt keine WebP-Dateien mehr zu zaehlen.
 # MAX_WEBP_COUNT = 200  # Maximal zu behaltende WebP-Dateien
@@ -175,13 +170,13 @@ def cleanup_old_tile_sets(output_dir, max_keep=MAX_TILE_DIRS):
 
     print(f"\n🧹 Bereinige alte Tile-Sets ({len(sets)} vorhanden, maximal {max_keep} erlaubt)...")
 
-    # Kein gh-pages-Checkout mehr: der Deploy-Ordner enthält genau den aktuellen
-    # Run (Namen sind chronologisch sortierbar). Behalten werden deshalb die
-    # zeitlich NÄCHSTEN Schritte, die fernsten Prognosestunden fliegen raus.
+    # Der Deploy-Ordner enthaelt genau den aktuellen Run (Namen sind
+    # chronologisch sortierbar). Behalten werden deshalb die zeitlich NAECHSTEN
+    # Schritte, die fernsten Prognosestunden fliegen raus.
     dropped = sets[max_keep:]
     if dropped:
         print(
-            f"   ⚠️ {len(dropped)} Zeitstempel entfallen wegen Dateilimit: "
+            f"   ⚠️ {len(dropped)} Zeitstempel entfallen (MAX_TILE_DIRS={max_keep}): "
             f"{dropped[0]} .. {dropped[-1]}"
         )
 
@@ -212,7 +207,19 @@ def existing_tile_sets(output_dir):
         name for name in os.listdir(tiles_root)
         if os.path.isdir(os.path.join(tiles_root, name))
     }
-        
+
+
+def publish_run_id(run_id):
+    """Gibt die Run-ID an GitHub Actions weiter (Ordnername unter runs/).
+
+    Ausserhalb von Actions (lokal, Colab) ist GITHUB_OUTPUT nicht gesetzt -
+    dann passiert einfach nichts.
+    """
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        with open(output_file, "a", encoding="utf-8") as fh:
+            fh.write(f"run_id={run_id}\n")
+
 
 def run_hrrr_pipeline():
     hrrr_run_env = os.environ.get("HRRR_TARGET_RUN") or os.environ.get("TARGET_RUN")
@@ -241,8 +248,10 @@ def run_hrrr_pipeline():
     # Initialisiere den echten HrrrWindProcessor
     processor = HrrrWindProcessor(output_folder=OUTPUT_DIR, width=2000)
 
-    # Key im HHMM-Format für den 15m Run
+    # Key im HHMM-Format für den 15m Run; dient gleichzeitig als Ordnername
+    # unter runs/ in der Storage-Zone (siehe upload_bunny.py).
     detected_current_time_key = target_time.strftime("%Y%m%d_%H%M")
+    publish_run_id(detected_current_time_key)
     processed_timestamps_15m = []
 
     current_step_time = target_time
@@ -349,17 +358,20 @@ def run_hrrr_pipeline():
             else all_timestamps[0]
         )
 
+        # Jeder Run liegt unter runs/<run>/; index.json im Root zeigt darauf.
+        # Die App baut ihre URLs aus diesen Templates ({timestamp} = "20261008_2000Z").
+        run_prefix = f"runs/{detected_current_time_key}"
         index_data = {
             "generated_at": datetime.now(timezone.utc)
             .isoformat()
             .replace("+00:00", "Z"),
+            "run": detected_current_time_key,
             "available_timestamps": all_timestamps,
             "current_hour": current_hour,
             "step_type": "15min",
             "api_version": API_VERSION,
-            # Templates fuer die Web-App: {timestamp} = "20261008_2000Z"
-            "tiles_url": f"{TILES_DIR_NAME}/{{timestamp}}/{{z}}/{{x}}/{{y}}.bin",
-            "meta_url": f"{META_DIR_NAME}/{{timestamp}}.json",
+            "tiles_url": f"{run_prefix}/{TILES_DIR_NAME}/{{timestamp}}/{{z}}/{{x}}/{{y}}.bin",
+            "meta_url": f"{run_prefix}/{META_DIR_NAME}/{{timestamp}}.json",
         }
 
         print(f"\n📝 Generiere {index_path}...")
