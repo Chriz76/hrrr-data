@@ -8,7 +8,6 @@ Beispiel:
 Layout in der Zone:
 
     runs/<run>/tiles/<timestamp>/<z>/<x>/<y>.bin   (vor-komprimiert, gzip)
-    runs/<run>/meta/<timestamp>.json
     index.json                                     (Root, zeigt auf runs/<run>/)
 
 Ablauf
@@ -19,8 +18,8 @@ Ablauf
      Geloescht wird pro Zeitstempel-Verzeichnis parallel; ein einzelner
      rekursiver DELETE auf einen ganzen Run (~23k Objekte) dauert ~1 Minute.
 
-Nicht hochgeladen wird die Cloudflare-Datei `_headers` – auf Bunny werden die
-Response-Header per Edge Rule im Pull Zone gesetzt.
+Response-Header (Content-Encoding/Cache-Control) setzt ausschliesslich eine
+Edge Rule im Pull Zone – die Storage-API kann keine Header speichern.
 
 Ausgabe: Fortschritt/Fehler -> stderr, Zusammenfassung -> stdout.
 """
@@ -43,9 +42,6 @@ CONTENT_TYPES = {
     ".json": "application/json; charset=utf-8",
     ".bin": "application/octet-stream",
 }
-
-# Cloudflare-Artefakt: auf Bunny wirkungslos.
-SKIP_FILES = {"_headers"}
 
 
 def log(message: str = "") -> None:
@@ -220,22 +216,18 @@ async def prune_old_runs(
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         # Phase 1: Kachel-Verzeichnisse parallel.
         await asyncio.gather(*(one(target) for target in tile_targets))
-        # Phase 2: pro Run nur noch meta/*.json + leere Verzeichnisse.
+        # Phase 2: pro Run nur noch das Geruest (leere Verzeichnisse).
         await asyncio.gather(*(one(f"runs/{run}/") for run in stale))
     return stale, errors
 
 
 def collect_items(root: Path) -> list[tuple[Path, str]]:
-    """Alle Dateien des Runs einsammeln (ohne Cloudflare-Artefakte)."""
+    """Alle Dateien des Runs einsammeln."""
     items: list[tuple[Path, str]] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        rel = path.relative_to(root).as_posix()
-        if rel in SKIP_FILES:
-            log(f"  uebersprungen: {rel} (auf Bunny per Edge Rule gesetzt)")
-            continue
-        items.append((path, rel))
+        items.append((path, path.relative_to(root).as_posix()))
     return items
 
 

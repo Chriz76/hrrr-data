@@ -2,8 +2,8 @@ name: Run Pipeline & Upload to Bunny Storage
 
 # Layout in der Zone:
 #   runs/<run>/tiles/<ts>/<z>/<x>/<y>.bin   (vor-komprimiert, gzip)
-#   runs/<run>/meta/<ts>.json
-#   index.json                              (Root, zeigt auf runs/<run>/)
+#   index.json                              (Root: Timestamps, Format, Bounds,
+#                                            Coverage, tiles_url)
 #
 # Ablauf: Run komplett nach runs/<run>/ hochladen, dann index.json im Root
 # umstellen (atomarer Switch), erst danach alte Runs loeschen.
@@ -17,9 +17,9 @@ name: Run Pipeline & Upload to Bunny Storage
 #
 # CORS im Pull Zone aktivieren (Access-Control-Allow-Origin: *).
 #
-# Grund: die Storage-HTTP-API kann keine Response-Header speichern, und die
-# Cloudflare-Datei "_headers" existiert bei Bunny nicht. "no-transform" bleibt
-# Pflicht, solange vor-komprimiert wird - sonst packt der CDN die bereits
+# Grund: die Storage-HTTP-API kann keine Response-Header speichern – Header
+# existieren ausschliesslich als Edge Rule. "no-transform" bleibt Pflicht,
+# solange vor-komprimiert wird - sonst packt der CDN die bereits
 # gzip-komprimierten Kacheln ein zweites Mal ein.
 #
 # Pruefen nach dem ersten Deploy:

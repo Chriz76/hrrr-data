@@ -31,9 +31,8 @@ MODEL_NAME_15MIN = "ncep_hrrr_conus_15min"  # HRRR: stündliche Runs, 15-Min-Sch
 
 # Ablage der Tiles im Deploy-Ordner (siehe process.py):
 #     tiles/<timestamp>/<z>/<x>/<y>.bin   (bereits gzip-komprimiert)
-#     meta/<timestamp>.json               (unkomprimiertes JSON)
+# Format-, Bounds- und Coverage-Infos stehen einmalig in index.json.
 TILES_DIR_NAME = "tiles"
-META_DIR_NAME = "meta"
 
 # Maximal zu behaltende Tile-Sets (ein Set = ein Zeitstempel = tiles/<ts>/...).
 #
@@ -44,7 +43,7 @@ META_DIR_NAME = "meta"
 # ~+11h statt +18h).
 #
 # Budget bei 37 Sets: ~37 x 613 Kacheln = ~22.700 Dateien
-#                     + 37 meta/*.json + index.json
+#                     + index.json (Format, Bounds, Coverage)
 #
 # Der Deploy-Ordner enthaelt immer nur den aktuellen Run (kein Cross-Run-
 # Wiederverwenden). Das Entfernen alter Sets in der Zone uebernimmt
@@ -61,32 +60,6 @@ HORIZON_END_HOURS = 18     # letzter Schritt (volle Stunde) bei +18h
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_OM_DIR, exist_ok=True)
-
-
-def ensure_headers_file(output_dir):
-    """Kopiert die `_headers`-Datei aus pipeline/static/ in das Deploy-Verzeichnis.
-
-    Die Datei ist zwingend nötig: die Tiles liegen bereits gzip-komprimiert auf
-    der Platte und werden nur über `Content-Encoding: gzip` korrekt ausgeliefert.
-    """
-    dst = os.path.join(output_dir, "_headers")
-    base_dir = (
-        os.path.dirname(os.path.abspath(__file__))
-        if "__file__" in globals()
-        else os.getcwd()
-    )
-    src = os.path.abspath(os.path.join(base_dir, os.pardir, "static", "_headers"))
-
-    if os.path.isfile(src):
-        shutil.copyfile(src, dst)
-        print(f"✅ _headers bereitgestellt: {dst}")
-    elif os.path.exists(dst):
-        print(f"ℹ️ _headers bereits vorhanden: {dst}")
-    else:
-        print(f"⚠️ _headers nicht gefunden (weder {src} noch {dst})")
-
-
-ensure_headers_file(OUTPUT_DIR)
 
 
 def download_file(url, local_path):
@@ -184,9 +157,6 @@ def cleanup_old_tile_sets(output_dir, max_keep=MAX_TILE_DIRS):
         set_path = os.path.join(tiles_root, name)
         try:
             shutil.rmtree(set_path)
-            meta_path = os.path.join(output_dir, META_DIR_NAME, f"{name}.json")
-            if os.path.exists(meta_path):
-                os.remove(meta_path)
             print(f"   🗑️ Gelöscht: {TILES_DIR_NAME}/{name}")
         except Exception as e:
             print(f"   ⚠️ Fehler beim Löschen von {set_path}: {e}")
@@ -221,6 +191,36 @@ def publish_run_id(run_id):
             fh.write(f"run_id={run_id}\n")
 
 
+def build_coverage(coords):
+    """(z, x, y)-Tripel -> {"z": {"x": [[y0, y1], ...]}}.
+
+    Pro Spalte x werden die vorhandenen y zu Laeufen zusammengefasst; normaler-
+    weise ist das genau ein Paar [y0, y1], weil das Gebiet zusammenhaengend ist.
+    Das Format ist exakt (keine Mercator-Nachrechnung im Client noetig) und
+    kompakt: fuer den ganzen Run wenige hundert Byte.
+    """
+    per_zoom = {}
+    for z, x, y in coords:
+        per_zoom.setdefault(int(z), {}).setdefault(int(x), []).append(int(y))
+
+    coverage = {}
+    for z, columns in sorted(per_zoom.items()):
+        cov_z = {}
+        for x, ys in sorted(columns.items()):
+            runs = []
+            start = prev = min(ys)
+            for y in sorted(ys)[1:]:
+                if y == prev + 1:
+                    prev = y
+                    continue
+                runs.append([start, prev])
+                start = prev = y
+            runs.append([start, prev])
+            cov_z[str(x)] = runs
+        coverage[str(z)] = cov_z
+    return coverage
+
+
 def run_hrrr_pipeline():
     hrrr_run_env = os.environ.get("HRRR_TARGET_RUN") or os.environ.get("TARGET_RUN")
 
@@ -253,6 +253,8 @@ def run_hrrr_pipeline():
     detected_current_time_key = target_time.strftime("%Y%m%d_%H%M")
     publish_run_id(detected_current_time_key)
     processed_timestamps_15m = []
+    # Kachelmengen je Zeitstempel (fuer die Coverage in index.json)
+    coords_per_step = []
 
     current_step_time = target_time
     consecutive_missing = 0
@@ -283,6 +285,7 @@ def run_hrrr_pipeline():
             if success:
                 processed_timestamps_15m.append(time_key)
                 print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
+                coords_per_step.append(set(processor.last_tile_coords))
         else:
             consecutive_missing += 1
             print(
@@ -329,6 +332,7 @@ def run_hrrr_pipeline():
             if success:
                 timestamps_hourly.append(time_key)
                 print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
+                coords_per_step.append(set(processor.last_tile_coords))
         else:
             consecutive_missing += 1
             print(
@@ -358,9 +362,19 @@ def run_hrrr_pipeline():
             else all_timestamps[0]
         )
 
-        # Jeder Run liegt unter runs/<run>/; index.json im Root zeigt darauf.
-        # Die App baut ihre URLs aus diesen Templates ({timestamp} = "20261008_2000Z").
+        # Jeder Run liegt unter runs/<run>/; index.json im Root ist der einzige
+        # Einstiegspunkt: Datenliste, Format, Bounds und Coverage in einer Datei.
         run_prefix = f"runs/{detected_current_time_key}"
+
+        coverage_set = set().union(*coords_per_step) if coords_per_step else set()
+        if coords_per_step and any(
+            coords != coords_per_step[0] for coords in coords_per_step
+        ):
+            print(
+                "⚠️ Kachelmenge unterscheidet sich zwischen Zeitstempeln "
+                "-> Coverage ist die Vereinigung"
+            )
+
         index_data = {
             "generated_at": datetime.now(timezone.utc)
             .isoformat()
@@ -370,8 +384,12 @@ def run_hrrr_pipeline():
             "current_hour": current_hour,
             "step_type": "15min",
             "api_version": API_VERSION,
+            # {timestamp} = "20261008_2000Z"; {z}/{x}/{y} setzt die App ein.
             "tiles_url": f"{run_prefix}/{TILES_DIR_NAME}/{{timestamp}}/{{z}}/{{x}}/{{y}}.bin",
-            "meta_url": f"{run_prefix}/{META_DIR_NAME}/{{timestamp}}.json",
+            # Format/Pyramide/Bounds sind pro Run konstant -> einmal hier.
+            **processor.format_descriptor(),
+            # Vorhandene Kacheln: {z: {x: [[y0, y1], ...]}}
+            "coverage": build_coverage(coverage_set),
         }
 
         print(f"\n📝 Generiere {index_path}...")
@@ -379,6 +397,8 @@ def run_hrrr_pipeline():
         print(f"   -> Stunden-Schritte (HH, 15m-Datensatz): {len(timestamps_hourly)}")
         print(f"   -> Gesamt kombiniert:      {len(all_timestamps)}")
         print(f"   -> Standard-Fokus (current_hour): {current_hour}")
+        if coords_per_step:
+            print(f"   -> Kacheln je Zeitstempel:      {len(coords_per_step[0])}")
 
         with open(index_path, "w") as f:
             json.dump(index_data, f, indent=2)

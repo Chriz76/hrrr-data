@@ -1,6 +1,5 @@
 import os
 import gzip
-import json
 import math
 import shutil
 import time
@@ -124,7 +123,7 @@ HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 #     <output>/tiles/<timestamp>/<z>/<x>/<y>.bin
 #
 # Die Datei ist also ein fertiger gzip-Container. Der Host MUSS sie mit
-# "Content-Encoding: gzip" ausliefern (Cloudflare Pages: siehe _headers), sonst
+# "Content-Encoding: gzip" ausliefern (Bunny: Edge Rule im Pull Zone), sonst
 # sieht der Browser die gzip-Bytes als Nutzdaten. Mit dem Header entpackt der
 # Browser transparent, d.h. fetch(...).arrayBuffer() liefert wieder die rohen
 # Tile-Bytes (Geo-Header + Laengen + int16-Streams).
@@ -161,17 +160,17 @@ TILE_FINEST_STRIDE = 1
 # Ablage der Kacheln als einzelne Dateien (klassisches Tileserver-Layout):
 #
 #     <output>/tiles/<timestamp>/<z>/<x>/<y>.bin
-#     <output>/meta/<timestamp>.json
 #
-# Zur Dateiendung: Cloudflare & Co. erkennen an der Endung NICHT, dass die Datei
-# bereits gzip-komprimiert ist. Es gibt KEINE Endung, die automatisch
+# Format-, Bounds- und Coverage-Infos stehen einmal pro Run in index.json.
+#
+# Zur Dateiendung: ein CDN erkennt an der Endung NICHT, dass die Datei bereits
+# gzip-komprimiert ist. Es gibt KEINE Endung, die automatisch
 # "Content-Encoding: gzip" setzt – auch ".gz" nicht (das liefert lediglich
 # "Content-Type: application/gzip", der Browser entpackt dann nichts). Der Header
-# kommt ausschliesslich aus der _headers-Datei. ".bin" ist daher neutral und wird
-# dort auf application/octet-stream + Content-Encoding: gzip gemappt.
+# kommt ausschliesslich aus einer Edge Rule im Pull Zone. ".bin" ist daher
+# neutral und wird dort auf application/octet-stream + Content-Encoding: gzip gemappt.
 TILE_FILE_EXT = "bin"
-TILES_SUBDIR = "tiles"   # NUR gzip-komprimierte Tiles (siehe _headers!)
-META_SUBDIR = "meta"     # unkomprimiertes JSON – darf NICHT unter /tiles/ liegen
+TILES_SUBDIR = "tiles"   # NUR gzip-komprimierte Tiles (Edge Rule: Content-Encoding)
 
 # Jede Kachel bekommt TILE_PADDING Zellen Halo auf allen 4 Seiten.
 # Der Client interpoliert linear; ohne Halo fehlt ihm an den Kachelrändern der
@@ -221,6 +220,9 @@ class HrrrWindProcessor:
         # _create_wind_direction_tiles gefüllt)
         self.last_step_timings = {}
         self.last_tile_stats = {}
+        # Alle (z, x, y) des zuletzt geschriebenen Tile-Sets. Daraus baut die
+        # Pipeline die Coverage fuer index.json.
+        self.last_tile_coords = []
         # Diagnose des Resamples: hatte die Quelldatei NaN?
         # (siehe _resample_to_regular_grid)
         self.source_had_nan = False
@@ -461,7 +463,7 @@ class HrrrWindProcessor:
         Container: ``[Geo-Header 24B][u_len 4B][v_len 4B][u_int16][v_int16]``,
         als EIN gzip-Strom. Weil das gzip nicht vom Webserver nachtraeglich
         angewendet wird, muss der Host ``Content-Encoding: gzip`` setzen
-        (Cloudflare Pages: ``_headers``). Danach entpackt der Browser transparent
+        (Edge Rule im Pull Zone). Danach entpackt der Browser transparent
         und ``response.arrayBuffer()`` liefert wieder die rohen Tile-Bytes.
 
         Als Gitter dient das reguläre Lat/Lon-Zwischengitter. Es wird bis ``max_zoom``
@@ -495,6 +497,8 @@ class HrrrWindProcessor:
         tiles_considered = 0
         tiles_skipped = 0
         tiles_written = 0
+        # Koordinaten der tatsaechlich geschriebenen Kacheln (Coverage fuer den Client)
+        self.last_tile_coords = []
 
         # Schleife über Web-Mercator Kacheln je Zoomstufe
         for z in range(min_zoom, max_zoom + 1):
@@ -596,7 +600,7 @@ class HrrrWindProcessor:
                     )
 
                     # Ganz-Tile-gzip -> die Datei ist ein gzip-Container, der Host
-                    # liefert sie mit Content-Encoding: gzip aus (siehe _headers).
+                    # liefert sie mit Content-Encoding: gzip aus (Edge Rule).
                     # mtime=0 -> reproduzierbare Bytes (kein Zeitstempel im Header)
                     _t_gz = time.perf_counter()
                     tile_bytes = gzip.compress(
@@ -620,6 +624,7 @@ class HrrrWindProcessor:
                     total_payload_bytes += len(tile_bytes)
                     max_tile_bytes = max(max_tile_bytes, len(tile_bytes))
                     tiles_written += 1
+                    self.last_tile_coords.append((z, x, y))
 
         t_tiles = time.perf_counter() - t_tiles_start
         file_size_kb = total_payload_bytes / 1024.0
@@ -664,27 +669,18 @@ class HrrrWindProcessor:
         }
         return True
 
-    def _write_meta_json(self, output_filename, tiles_dir):
-        """Schreibt die Format-/Gitter-Beschreibung eines Timesteps als JSON.
+    def format_descriptor(self):
+        """Format-, Pyramiden- und Gebietsbeschreibung fuer ``index.json``.
 
-        Ersetzt den Metadata-Block, den vorher der PMTiles-Container mitgeliefert
-        hat. Liegt bewusst NICHT unter ``/tiles/``, weil dort alles als gzip
-        ausgeliefert wird (siehe _headers). Liefert den geschriebenen Pfad zurück.
+        Diese Werte sind pro Run konstant (Modulkonstanten + Gitterableitung)
+        und werden deshalb EINMAL in den Index geschrieben statt pro Zeitstempel
+        in eine eigene meta-Datei. Die Geo-Referenz jeder einzelnen Kachel steht
+        ohnehin in deren 24-Byte-Header.
         """
-        meta_dir = os.path.join(self.output_folder, META_SUBDIR)
-        os.makedirs(meta_dir, exist_ok=True)
-        meta_path = os.path.join(meta_dir, f"{output_filename}.json")
-
-        meta = {
-            "timestamp": output_filename,
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        return {
             "format": {
                 "id": "hrrr-wind-int16-delta",
                 "version": 1,
-                "tile_url": (
-                    f"/{TILES_SUBDIR}/{output_filename}/"
-                    f"{{z}}/{{x}}/{{y}}.{TILE_FILE_EXT}"
-                ),
                 "encoding": "gzip",
                 "layout": (
                     "24B Geo-Header (6x float32 LE: origin_lng, origin_lat, "
@@ -704,7 +700,7 @@ class HrrrWindProcessor:
                 "finest_stride": TILE_FINEST_STRIDE,
                 "padding_cells": TILE_PADDING,
                 "resolution_deg": self.src_resolution,
-                "tile_set": os.path.basename(tiles_dir),
+                "tile_ext": TILE_FILE_EXT,
             },
             "bounds": {
                 "west": self.lon_min,
@@ -713,10 +709,6 @@ class HrrrWindProcessor:
                 "north": self.lat_max,
             },
         }
-
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-        return meta_path
 
     def _print_step_timings(self, step_duration):
         """Gibt die gemessenen Zeitanteile eines Timesteps als kleine Tabelle aus."""
@@ -817,11 +809,11 @@ class HrrrWindProcessor:
 
         # --- E. Tiles (einzelne gzip-Dateien pro Kachel, Tileserver-Layout) ---
         # output_filename traegt nur den Zeitstempel ("...Z") als Namensbasis.
-        # Ergebnis: <output>/tiles/<timestamp>/<z>/<x>/<y>.bin + <output>/meta/<timestamp>.json
+        # Ergebnis: <output>/tiles/<timestamp>/<z>/<x>/<y>.bin
+        # Die Geo-/Format-Infos stehen im 24-Byte-Kachelkopf; die Liste der
+        # vorhandenen Kacheln liefert self.last_tile_coords.
         tiles_dir = os.path.join(self.output_folder, TILES_SUBDIR, output_filename)
         success_tiles = self._create_wind_direction_tiles(u_grid, v_grid, tiles_dir)
-        if os.path.isdir(tiles_dir):
-            self._write_meta_json(output_filename, tiles_dir)
         _lap("tiles")
 
         if os.path.exists(om_path):
