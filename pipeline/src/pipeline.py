@@ -1,22 +1,14 @@
-import glob
 import json
 import os
 import shutil
-import sys
 import time
 from datetime import datetime, timedelta, timezone
+
 import requests
 
-# Erlaubt den Import von process.py im selben Ordner
-if "__file__" in globals():
-    sys.path.append(os.path.dirname(__file__))
-else:
-    sys.path.append(os.path.abspath("."))
-
-try:
-    from process import HrrrWindProcessor
-except ImportError:
-    pass  # Die Klasse 'HrrrWindProcessor' ist in Colab bereits im RAM!
+# process.py liegt im selben Ordner: beim Aufruf `python pipeline/src/pipeline.py`
+# ist dieses Verzeichnis bereits sys.path[0].
+from process import HrrrWindProcessor
 
 
 # --- KONFIGURATION ---
@@ -34,32 +26,18 @@ MODEL_NAME_15MIN = "ncep_hrrr_conus_15min"  # HRRR: stündliche Runs, 15-Min-Sch
 # Format-, Bounds- und Coverage-Infos stehen einmalig in index.json.
 TILES_DIR_NAME = "tiles"
 
-# Maximal zu behaltende Tile-Sets (ein Set = ein Zeitstempel = tiles/<ts>/...).
+# Budget eines vollen Runs: ~37 Zeitstempel (25 x 15-min bis +6h, dann 12
+# stuendliche bis +18h) x ~613 Kacheln = ~22.700 Dateien + index.json.
 #
-# Kein Host-Dateilimit mehr (Bunny Storage): ein voller Run liefert aktuell
-# ~37 Zeitstempel (25 x 15-min bis +6h, dann 12 stuendliche bis +18h).
-# MAX_TILE_DIRS >= 37 behaelt den kompletten Horizont; ein kleinerer Wert
-# schneidet die FERNSTEN Prognosestunden ab (bei 30 endet der Horizont bei
-# ~+11h statt +18h).
-#
-# Budget bei 37 Sets: ~37 x 613 Kacheln = ~22.700 Dateien
-#                     + index.json (Format, Bounds, Coverage)
-#
-# Der Deploy-Ordner enthaelt immer nur den aktuellen Run (kein Cross-Run-
-# Wiederverwenden). Das Entfernen alter Sets in der Zone uebernimmt
-# upload_bunny.py mit --prune.
-MAX_TILE_DIRS = int(os.environ.get("MAX_TILE_DIRS", "30"))
-# Auskommentiert: das Feld-WebP entfaellt, es gibt keine WebP-Dateien mehr zu zaehlen.
-# MAX_WEBP_COUNT = 200  # Maximal zu behaltende WebP-Dateien
+# Der Deploy-Ordner enthaelt immer nur den aktuellen Run: alte Tile-Sets werden
+# zu Beginn des Laufs entfernt. Alte Runs in der Zone raeumt upload_bunny.py
+# mit --prune ab.
 
-# Horizont:
+# Horizont (per Env ueberschreibbar):
 #   +0 .. +HORIZON_15MIN_HOURS   -> alle 15 Minuten (HHMM)
 #   danach .. +HORIZON_END_HOURS -> nur ganze Stunden (HH), gleicher Datensatz
-HORIZON_15MIN_HOURS = 6    # 15-Min-Schritte bis +6h (einschließlich)
-HORIZON_END_HOURS = 18     # letzter Schritt (volle Stunde) bei +18h
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(TEMP_OM_DIR, exist_ok=True)
+HORIZON_15MIN_HOURS = int(os.environ.get("HORIZON_15MIN_HOURS", "6"))
+HORIZON_END_HOURS = int(os.environ.get("HORIZON_END_HOURS", "18"))
 
 
 def download_file(url, local_path):
@@ -93,97 +71,36 @@ def download_file(url, local_path):
     return False
 
 
-def cleanup_old_files(output_dir, pattern, max_keep, label):
-    """Löscht ältere Dateien im Ausgabeordner basierend auf dem Dateinamen."""
-    files = glob.glob(os.path.join(output_dir, pattern))
+def build_steps(target_time):
+    """Zeitschritte des Laufs als Liste von (Zeit, Zeitstempel-Format, Label).
 
-    if len(files) > max_keep:
-        print(f"\n🧹 Bereinige alte {label} ({len(files)} vorhanden, maximal {max_keep} erlaubt)...")
-        # Alphabethische Sortierung nach Dateinamen (älteste Timestamps stehen vorne)
-        files.sort()
-
-        # Alle Dateien bis auf die letzten max_keep (die neuesten) löschen
-        files_to_delete = files[:-max_keep]
-        for file_path in files_to_delete:
-            try:
-                os.remove(file_path)
-                print(f"   🗑️ Gelöscht: {os.path.basename(file_path)}")
-            except Exception as e:
-                print(f"   ⚠️ Fehler beim Löschen von {file_path}: {e}")
-        print(f"✅ Bereinigung abgeschlossen. Es verbleiben {max_keep} {label}.")
-
-
-# Auskommentiert: nur fuer das Feld-WebP relevant.
-# def cleanup_old_webps(output_dir, max_keep=200):
-#     """Löscht ältere WebP-Dateien im Ausgabeordner basierend auf dem Dateinamen."""
-#     cleanup_old_files(output_dir, "*.webp", max_keep, "WebP-Dateien")
-
-
-def cleanup_old_tile_sets(output_dir, max_keep=MAX_TILE_DIRS):
-    """Begrenzt die Zahl der Tile-Sets (tiles/<timestamp>/) inkl. ihrer Metadaten.
-
-    Die Zeitstempel-Namen sind lexikografisch sortierbar (ältester zuerst).
-    Behalten werden die ``max_keep`` zeitlich NÄCHSTEN Sets – das ist der
-    Deploy-Budget-Deckel für Cloudflare Pages (Dateilimit), kein Cross-Run-
-    Rolling-Window mehr. Gelöscht wird immer das komplette Verzeichnis, damit
-    keine verwaisten Kacheln zurückbleiben.
+    Erst alle 15 Minuten bis +HORIZON_15MIN_HOURS, danach nur ganze Stunden bis
+    +HORIZON_END_HOURS - beides aus demselben 15-Minuten-Datensatz.
     """
-    tiles_root = os.path.join(output_dir, TILES_DIR_NAME)
-    if not os.path.isdir(tiles_root):
-        return
+    steps = []
 
-    sets = sorted(
-        name for name in os.listdir(tiles_root)
-        if os.path.isdir(os.path.join(tiles_root, name))
-    )
+    horizon_15min = target_time + timedelta(hours=HORIZON_15MIN_HOURS)
+    step_time = target_time
+    while step_time <= horizon_15min:
+        steps.append((step_time, "%Y%m%d_%H%M", "15-Minuten"))
+        step_time += timedelta(minutes=15)
 
-    if len(sets) <= max_keep:
-        print(f"ℹ️ Tile-Sets: {len(sets)} vorhanden (maximal {max_keep}) – nichts zu löschen.")
-        return
+    # Erste volle Stunde NACH dem 15-Min-Horizont: horizon_15min selbst wurde
+    # oben schon als HHMM-Schritt verarbeitet -> keine Doppelverarbeitung.
+    horizon_end = target_time + timedelta(hours=HORIZON_END_HOURS)
+    step_time = horizon_15min + timedelta(hours=1)
+    while step_time <= horizon_end:
+        steps.append((step_time, "%Y%m%d_%H", "Stunden"))
+        step_time += timedelta(hours=1)
 
-    print(f"\n🧹 Bereinige alte Tile-Sets ({len(sets)} vorhanden, maximal {max_keep} erlaubt)...")
-
-    # Der Deploy-Ordner enthaelt genau den aktuellen Run (Namen sind
-    # chronologisch sortierbar). Behalten werden deshalb die zeitlich NAECHSTEN
-    # Schritte, die fernsten Prognosestunden fliegen raus.
-    dropped = sets[max_keep:]
-    if dropped:
-        print(
-            f"   ⚠️ {len(dropped)} Zeitstempel entfallen (MAX_TILE_DIRS={max_keep}): "
-            f"{dropped[0]} .. {dropped[-1]}"
-        )
-
-    for name in dropped:
-        set_path = os.path.join(tiles_root, name)
-        try:
-            shutil.rmtree(set_path)
-            print(f"   🗑️ Gelöscht: {TILES_DIR_NAME}/{name}")
-        except Exception as e:
-            print(f"   ⚠️ Fehler beim Löschen von {set_path}: {e}")
-
-    remaining = sorted(
-        name for name in os.listdir(tiles_root)
-        if os.path.isdir(os.path.join(tiles_root, name))
-    )
-    print(f"✅ Bereinigung abgeschlossen. Es verbleiben {len(remaining)} Tile-Sets.")
-
-
-def existing_tile_sets(output_dir):
-    """Liefert die Menge der Zeitstempel (mit 'Z'), für die Kacheln vorliegen."""
-    tiles_root = os.path.join(output_dir, TILES_DIR_NAME)
-    if not os.path.isdir(tiles_root):
-        return set()
-    return {
-        name for name in os.listdir(tiles_root)
-        if os.path.isdir(os.path.join(tiles_root, name))
-    }
+    return steps
 
 
 def publish_run_id(run_id):
     """Gibt die Run-ID an GitHub Actions weiter (Ordnername unter runs/).
 
-    Ausserhalb von Actions (lokal, Colab) ist GITHUB_OUTPUT nicht gesetzt -
-    dann passiert einfach nichts.
+    Ausserhalb von Actions (lokal) ist GITHUB_OUTPUT nicht gesetzt - dann
+    passiert einfach nichts.
     """
     output_file = os.environ.get("GITHUB_OUTPUT")
     if output_file:
@@ -245,115 +162,67 @@ def run_hrrr_pipeline():
     )
     print(f"========================================================")
 
-    # Initialisiere den echten HrrrWindProcessor
-    processor = HrrrWindProcessor(output_folder=OUTPUT_DIR, width=2000)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TEMP_OM_DIR, exist_ok=True)
 
-    # Key im HHMM-Format für den 15m Run; dient gleichzeitig als Ordnername
-    # unter runs/ in der Storage-Zone (siehe upload_bunny.py).
+    # Der Deploy-Ordner enthaelt nur den aktuellen Run: Tile-Sets eines frueheren
+    # (z.B. lokalen) Laufs wuerden sonst mit hochgeladen.
+    tiles_root = os.path.join(OUTPUT_DIR, TILES_DIR_NAME)
+    if os.path.isdir(tiles_root):
+        shutil.rmtree(tiles_root)
+        print(f"🧹 Alte Tile-Sets entfernt: {tiles_root}")
+
+    processor = HrrrWindProcessor(output_folder=OUTPUT_DIR)
+
+    # Key im HHMM-Format; dient gleichzeitig als Ordnername unter runs/ in der
+    # Storage-Zone (siehe upload_bunny.py).
     detected_current_time_key = target_time.strftime("%Y%m%d_%H%M")
     publish_run_id(detected_current_time_key)
-    processed_timestamps_15m = []
+
+    processed_timestamps = []
     # Kachelmengen je Zeitstempel (fuer die Coverage in index.json)
     coords_per_step = []
-
-    current_step_time = target_time
     consecutive_missing = 0
 
-    # 1. 15-MINUTEN RUN VERARBEITEN (alle 15 Min bis +HORIZON_15MIN_HOURS)
-    horizon_15min = target_time + timedelta(hours=HORIZON_15MIN_HOURS)
-    while consecutive_missing < 2 and current_step_time <= horizon_15min:
-        time_key = current_step_time.strftime("%Y%m%d_%H%M")  # HHMM-Format
+    for step_time, key_format, label in build_steps(target_time):
+        if consecutive_missing >= 2:
+            print(
+                f"   ℹ️ Zwei Schritte hintereinander fehlend - Horizont endet vor "
+                f"{step_time.strftime('%Y-%m-%dT%H:%M')}Z"
+            )
+            break
+
+        time_key = step_time.strftime(key_format)
         # Traegt nur noch den Zeitstempel als Namensbasis; pro Kachel entsteht
         # eine einzelne gzip-Datei unter tiles/<timestamp>/<z>/<x>/<y>.bin.
         output_name = f"{time_key}Z"
-        iso_file_name = f"{current_step_time.strftime('%Y-%m-%dT%H%M')}.om"
+        iso_file_name = f"{step_time.strftime('%Y-%m-%dT%H%M')}.om"
 
         url_om = f"https://openmeteo.s3.amazonaws.com/data_spatial/{MODEL_NAME_15MIN}/{year}/{month}/{day}/{run_hour_z}/{iso_file_name}"
         om_path = os.path.join(TEMP_OM_DIR, iso_file_name)
 
-        print(f"   -> Downloade 15m-Schritt: {iso_file_name}...")
+        print(f"   -> Downloade {label}-Schritt: {iso_file_name}...")
 
-        if download_file(url_om, om_path):
-            consecutive_missing = 0
-            success = processor.process_om_file(
-                om_path, output_filename=output_name
-            )
-
-            if os.path.exists(om_path):
-                os.remove(om_path)
-
-            if success:
-                processed_timestamps_15m.append(time_key)
-                print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
-                coords_per_step.append(set(processor.last_tile_coords))
-        else:
-            consecutive_missing += 1
-            print(
-                f"   ℹ️ Datei {iso_file_name} im Run {run_hour_z} nicht mehr vorhanden."
-            )
-
-        current_step_time += timedelta(minutes=15)
-
-    # 2. NUR NOCH GANZE STUNDEN AUS DEMSELBEN 15-MINUTEN-RUN (bis +18h)
-    #
-    #    Kein Wechsel mehr auf 'ncep_hrrr_conus' (stündlich): der 15-Minuten-
-    #    Datensatz deckt denselben Zeitraum ab, enthält also auch die :00-Schritte.
-    #    Ab hier wird nur noch jede volle Stunde geladen (Key im HH-Format), damit
-    #    die Dateizahl nicht explodiert. Es gibt KEINE separate Run-Rückwärtssuche:
-    #    es gelten dieselben year/month/day/run_hour_z wie für die 15-Min-Schritte.
-    timestamps_hourly = []
-
-    horizon_end = target_time + timedelta(hours=HORIZON_END_HOURS)
-
-    # Erste volle Stunde NACH dem 15-Min-Horizont. horizon_15min selbst wurde im
-    # 15-Min-Loop bereits als HHMM-Schritt verarbeitet -> keine Doppelverarbeitung.
-    current_hour_time = horizon_15min + timedelta(hours=1)
-    consecutive_missing = 0
-
-    while current_hour_time <= horizon_end and consecutive_missing < 2:
-        time_key = current_hour_time.strftime("%Y%m%d_%H")  # HH-Format
-        output_name = f"{time_key}Z"
-        iso_file_name = f"{current_hour_time.strftime('%Y-%m-%dT%H%M')}.om"
-
-        url_om = f"https://openmeteo.s3.amazonaws.com/data_spatial/{MODEL_NAME_15MIN}/{year}/{month}/{day}/{run_hour_z}/{iso_file_name}"
-        om_path = os.path.join(TEMP_OM_DIR, iso_file_name)
-
-        print(f"   -> Downloade Stundenschritt (15m-Datensatz): {iso_file_name}...")
-
-        if download_file(url_om, om_path):
-            consecutive_missing = 0
-            success = processor.process_om_file(
-                om_path, output_filename=output_name
-            )
-
-            if os.path.exists(om_path):
-                os.remove(om_path)
-
-            if success:
-                timestamps_hourly.append(time_key)
-                print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
-                coords_per_step.append(set(processor.last_tile_coords))
-        else:
+        if not download_file(url_om, om_path):
             consecutive_missing += 1
             print(
                 f"   ℹ️ Datei {iso_file_name} im Run {run_hour_z} nicht (mehr) vorhanden."
             )
+            continue
 
-        current_hour_time += timedelta(hours=1)
+        consecutive_missing = 0
+        # process_om_file loescht die .om-Datei am Ende selbst.
+        if processor.process_om_file(om_path, output_filename=output_name):
+            processed_timestamps.append(time_key)
+            print(f"      ✅ Erfolgreich prozessiert -> {TILES_DIR_NAME}/{time_key}Z/")
+            coords_per_step.append(set(processor.last_tile_coords))
 
-    # 3. AUFRÄUMEN, DANN INDEX.JSON GENERIEREN
-    #
-    # Bewusst in dieser Reihenfolge: der Index darf nur Zeitstempel auflisten,
-    # für die nach dem Aufräumen auch noch Kacheln auf der Platte liegen.
-    cleanup_old_tile_sets(OUTPUT_DIR, max_keep=MAX_TILE_DIRS)
+    # --- INDEX.JSON ---
+    all_timestamps = sorted(set(processed_timestamps))
 
-    all_timestamps = sorted(
-        list(set(processed_timestamps_15m + timestamps_hourly))
-    )
-    present_sets = existing_tile_sets(OUTPUT_DIR)
-    all_timestamps = [ts for ts in all_timestamps if f"{ts}Z" in present_sets]
-
-    if all_timestamps:
+    if not all_timestamps:
+        print("⚠️ Warnung: Keine Daten-Timestamps erzeugt.")
+    else:
         index_path = os.path.join(OUTPUT_DIR, "index.json")
 
         current_hour = (
@@ -393,8 +262,10 @@ def run_hrrr_pipeline():
         }
 
         print(f"\n📝 Generiere {index_path}...")
-        print(f"   -> 15-Min-Schritte (HHMM): {len(processed_timestamps_15m)}")
-        print(f"   -> Stunden-Schritte (HH, 15m-Datensatz): {len(timestamps_hourly)}")
+        # HHMM-Keys sind 13 Zeichen ("YYYYMMDD_HHMM"), Stunden-Keys 11.
+        count_15min = sum(1 for ts in all_timestamps if len(ts) > 11)
+        print(f"   -> 15-Min-Schritte (HHMM): {count_15min}")
+        print(f"   -> Stunden-Schritte (HH, 15m-Datensatz): {len(all_timestamps) - count_15min}")
         print(f"   -> Gesamt kombiniert:      {len(all_timestamps)}")
         print(f"   -> Standard-Fokus (current_hour): {current_hour}")
         if coords_per_step:
@@ -403,12 +274,6 @@ def run_hrrr_pipeline():
         with open(index_path, "w") as f:
             json.dump(index_data, f, indent=2)
         print("✅ index.json erfolgreich erstellt!")
-    else:
-        print("⚠️ Warnung: Keine Daten-Timestamps erzeugt.")
-
-    # Alte WebP-Dateien nach Dateinamen-Sortierung bereinigen
-    # (auskommentiert: es werden keine Feld-WebPs mehr erzeugt)
-    # cleanup_old_webps(OUTPUT_DIR, max_keep=MAX_WEBP_COUNT)
 
     # Aufräumen
     if os.path.exists(TEMP_OM_DIR):

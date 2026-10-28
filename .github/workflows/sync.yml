@@ -8,23 +8,8 @@ name: Run Pipeline & Upload to Bunny Storage
 # Ablauf: Run komplett nach runs/<run>/ hochladen, dann index.json im Root
 # umstellen (atomarer Switch), erst danach alte Runs loeschen.
 #
-# Einmalig im Pull Zone (CDN -> dein Pull Zone -> Edge Rules) anzulegen,
-# Action jeweils "Set Response Header":
-#
-#   Trigger *.bin  ->  Content-Encoding: gzip
-#   Trigger *.bin  ->  Cache-Control: no-store, no-transform
-#   Trigger *.json ->  Cache-Control: no-store
-#
-# CORS im Pull Zone aktivieren (Access-Control-Allow-Origin: *).
-#
-# Grund: die Storage-HTTP-API kann keine Response-Header speichern – Header
-# existieren ausschliesslich als Edge Rule. "no-transform" bleibt Pflicht,
-# solange vor-komprimiert wird - sonst packt der CDN die bereits
-# gzip-komprimierten Kacheln ein zweites Mal ein.
-#
-# Pruefen nach dem ersten Deploy:
-#   curl -sI https://<pullzone-host>/tiles/<ts>/7/20/51.bin
-#   -> content-encoding: gzip
+# Einmalige Pull-Zone-Konfiguration (Edge Rules fuer Content-Encoding/Cache,
+# CORS) siehe README.md.
 
 on:
   workflow_dispatch:
@@ -47,15 +32,8 @@ env:
   BUNNY_STORAGE_ZONE: gdsfgfsdgsfd
   # Die Pipeline schreibt direkt in den Deploy-Ordner.
   OUTPUT_DIR: ./t
-  # Bunny hat kein Dateilimit wie Cloudflare Pages (20k) -> voller Horizont
-  # (~37 Zeitstempel). Fuer den alten 30er-Deckel hier wieder '30' eintragen.
-  MAX_TILE_DIRS: '40'
-  # 48 parallele PUTs; mehr als ~100 gleichzeitige Verbindungen pro IP gibt 429.
-  UPLOAD_CONCURRENCY: '48'
-  # Loeschen: max. 30 gleichzeitige DELETEs pro Zone/Server erlaubt.
-  DELETE_CONCURRENCY: '24'
-  # Vorherige Runs als Rollback-Fenster behalten (0 = nur der aktuelle bleibt).
-  KEEP_RUNS: '1'
+  # Parallelitaet (48 PUTs / 24 DELETEs) und das Rollback-Fenster (KEEP_RUNS=1)
+  # stehen als Defaults in pipeline/src/upload_bunny.py.
 
 jobs:
   pipeline:
@@ -108,31 +86,8 @@ jobs:
           python pipeline/src/upload_bunny.py \
             --dir "$OUTPUT_DIR" \
             --run "$RUN_ID" \
-            --keep-runs "$KEEP_RUNS" \
-            --concurrency "$UPLOAD_CONCURRENCY" \
-            --delete-concurrency "$DELETE_CONCURRENCY" \
             --prune
 
-      # Optional: braucht die Repository-Variable BUNNY_PULLZONE_HOST
-      # (z.B. winddata.b-cdn.net) und das Secret BUNNYNET_API_KEY.
-      # Die Kacheln liegen unter neuen Run-Pfaden (Cache-Miss), nur der
-      # Index aendert sich pro Lauf und muss aus dem Cache.
-      - name: index.json im CDN-Cache verwerfen
-        if: vars.BUNNY_PULLZONE_HOST != ''
-        env:
-          BUNNYNET_API_KEY: ${{ secrets.BUNNYNET_API_KEY }}
-          HOST: ${{ vars.BUNNY_PULLZONE_HOST }}
-        run: |
-          set -euo pipefail
-          if [ -z "${BUNNYNET_API_KEY:-}" ]; then
-            echo "::warning::BUNNYNET_API_KEY fehlt - Cache-Purge uebersprungen"
-            exit 0
-          fi
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -G \
-            -H "AccessKey: $BUNNYNET_API_KEY" \
-            --data-urlencode "url=https://$HOST/index.json" \
-            "https://api.bunny.net/purge")
-          echo "Purge https://$HOST/index.json -> HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::warning::Purge lieferte HTTP $code"
-          fi
+      # Kein Cache-Purge mehr: die Edge Rule "Override Cache Time = 0" sorgt
+      # dafuer, dass index.json bei jedem Abruf vom Origin kommt. Die Kacheln
+      # liegen unter neuen Run-Pfaden und sind damit ohnehin Cache-Miss.

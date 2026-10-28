@@ -204,22 +204,17 @@ class HrrrWindProcessor:
     _STEP_LABELS = (
         ("read", "Read .om"),
         ("resample", "Resample LCC->Gitter"),
-        # --- folgende zwei Schritte gehoeren nur zum Feld-WebP und sind auskommentiert ---
-        # ("field", "Feldbild rendern"),
-        # ("webp_save", "Feld-WebP speichern"),
         ("tiles", "Tiles schreiben"),
         ("cleanup", "Temp loeschen"),
     )
 
-    def __init__(self, output_folder="./wind_tiles_hrrr", width=2000, src_resolution=0.025):
+    def __init__(self, output_folder="./wind_tiles_hrrr", src_resolution=0.025):
         init_start_time = time.perf_counter()
         self.output_folder = output_folder
         os.makedirs(self.output_folder, exist_ok=True)
 
-        # Messwerte des letzten Timesteps (werden von process_om_file bzw.
-        # _create_wind_direction_tiles gefüllt)
+        # Zeitanteile des letzten Timesteps (siehe process_om_file)
         self.last_step_timings = {}
-        self.last_tile_stats = {}
         # Alle (z, x, y) des zuletzt geschriebenen Tile-Sets. Daraus baut die
         # Pipeline die Coverage fuer index.json.
         self.last_tile_coords = []
@@ -228,7 +223,6 @@ class HrrrWindProcessor:
         self.source_had_nan = False
         self._nan_warned = False
 
-        self.width = width
         # Auflösung des regulären Lat/Lon-Zwischengitters (Open-Meteo-kompatibel)
         self.src_resolution = src_resolution
 
@@ -243,55 +237,6 @@ class HrrrWindProcessor:
 
         # Mapping reguläres Gitter -> natives HRRR-Gitter (projizierte Row/Col-Indizes)
         self._build_resample_coords()
-
-        # --- NUR FUER DAS FELD-WEBP (auskommentiert) ---------------------------------
-        # Das Tile-Artefakt braucht keines davon: es arbeitet direkt auf dem
-        # regulären Lat/Lon-Zwischengitter. Gebraucht wurde es ausschliesslich fuer
-        # das farbcodierte Windgeschwindigkeits-Overlay ("...Z.webp"), das ein
-        # Mercator-Zielgitter mit fester Pixelbreite plus eine 13-Farben-Palette
-        # voraussetzt.
-        #
-        # Mercator-Y Berechnungen
-        # y_min_merc = np.degrees(np.log(np.tan(np.pi / 4.0 + np.radians(self.lat_min) / 2.0)))
-        # y_max_merc = np.degrees(np.log(np.tan(np.pi / 4.0 + np.radians(self.lat_max) / 2.0)))
-        #
-        # # Höhe proportional zur Mercator-Verzerrung
-        # self.height = int(self.width * (y_max_merc - y_min_merc) / (self.lon_max - self.lon_min))
-        #
-        # # 1. Ziel-Grid in Web-Mercator definieren (Pixel 0 oben = Nord = y_max_merc)
-        # grid_x_linear = np.linspace(self.lon_min, self.lon_max, self.width)
-        # grid_y_merc = np.linspace(y_max_merc, y_min_merc, self.height)
-        #
-        # grid_x, grid_y = np.meshgrid(grid_x_linear, grid_y_merc)
-        #
-        # # 2. Rücktransformation der Mercator-Y-Pixel in echte WGS84-Latitudes
-        # lat_source = np.degrees(2 * np.arctan(np.exp(np.radians(grid_y))) - np.pi / 2.0)
-        # lon_source = grid_x
-        #
-        # # 3. Indizes für das reguläre Lat/Lon-Quellgitter
-        # row_indices = (lat_source - self.lat_min) / (self.lat_max - self.lat_min) * (self.src_lat_shape - 1)
-        # col_indices = (lon_source - self.lon_min) / (self.lon_max - self.lon_min) * (self.src_lon_shape - 1)
-        #
-        # # Fertige Lookup-Matrix (Ziel-Pixel -> Zeile/Spalte im Zwischengitter)
-        # self.interp_coords = np.array([row_indices, col_indices], dtype=np.float32)
-        #
-        # # Farbschema
-        # self.color_palette = np.array([
-        #     [0, 0, 0, 0],         # 0: Out of bounds / NaN
-        #     [230, 255, 255, 255], # 1: < 3 Knots
-        #     [0, 191, 255, 255],   # 2: < 5
-        #     [0, 255, 204, 255],   # 3: < 6
-        #     [0, 204, 0, 255],     # 4: < 7
-        #     [153, 255, 0, 255],   # 5: < 8
-        #     [255, 255, 0, 255],   # 6: < 9
-        #     [209, 158, 0, 255],   # 7: < 10
-        #     [255, 85, 0, 255],    # 8: < 12
-        #     [255, 0, 0, 255],     # 9: < 15
-        #     [255, 51, 153, 255],  # 10: < 20
-        #     [153, 0, 204, 255],   # 11: < 25
-        #     [0, 0, 255, 255]      # 12: >= 25
-        # ], dtype=np.uint8)
-        # --- ENDE NUR FUER DAS FELD-WEBP --------------------------------------------
 
         init_duration = time.perf_counter() - init_start_time
         print(
@@ -352,7 +297,7 @@ class HrrrWindProcessor:
         """Resampelt die projizierten HRRR-Felder (ny, nx) auf das reguläre
         Lat/Lon-Zwischengitter. Punkte außerhalb des HRRR-Rasters werden NaN.
 
-        Rückgabe: (u_reg, v_reg, valid) – valid ist True innerhalb des Rasters.
+        Rückgabe: (u_reg, v_reg)
 
         Zur Gültigkeit: das native HRRR-Array ist deckungsgleich mit der Modell-
         domain, Open-Meteo legt es ohne Randmaske ab. Es sollte also gar keine NaN
@@ -402,9 +347,7 @@ class HrrrWindProcessor:
 
         u_reg[~valid] = np.nan
         v_reg[~valid] = np.nan
-        # copy(): im schnellen Pfad ist valid die gecachte statische Maske und darf
-        # vom Aufrufer nicht in-place veraendert werden.
-        return u_reg, v_reg, valid.copy()
+        return u_reg, v_reg
 
     @staticmethod
     def _encode_field_pred(field, stats=None):
@@ -459,8 +402,8 @@ class HrrrWindProcessor:
 
         z.B. ``output/tiles/20261008_2000Z/7/20/51.bin``.
 
-        Der Dateiinhalt ist exakt der bisherige PMTiles-Tile-Payload, nur ohne
-        Container: ``[Geo-Header 24B][u_len 4B][v_len 4B][u_int16][v_int16]``,
+        Der Dateiinhalt ist ein einzelnes Tile ohne Container:
+        ``[Geo-Header 24B][u_len 4B][v_len 4B][u_int16][v_int16]``,
         als EIN gzip-Strom. Weil das gzip nicht vom Webserver nachtraeglich
         angewendet wird, muss der Host ``Content-Encoding: gzip`` setzen
         (Edge Rule im Pull Zone). Danach entpackt der Browser transparent
@@ -627,7 +570,6 @@ class HrrrWindProcessor:
                     self.last_tile_coords.append((z, x, y))
 
         t_tiles = time.perf_counter() - t_tiles_start
-        file_size_kb = total_payload_bytes / 1024.0
         per_tile_kb = (
             total_payload_bytes / tiles_written / 1024.0 if tiles_written else 0.0
         )
@@ -653,21 +595,6 @@ class HrrrWindProcessor:
             f"      Kacheln: {tiles_written} geschrieben | {tiles_skipped} leer "
             f"übersprungen | {tiles_considered} im Gebiet | Ø {per_tile_ms:.2f} ms/Kachel"
         )
-
-        self.last_tile_stats = {
-            "tiles": t_tiles,
-            "window": t_tiles - t_encode,
-            "encode": t_encode,
-            "write": t_write,
-            "encode_prep": enc_stats.get("prep", 0.0),
-            "encode_codec": enc_stats.get("codec", 0.0),
-            "tiles_written": tiles_written,
-            "tiles_skipped": tiles_skipped,
-            "tiles_considered": tiles_considered,
-            "payload_bytes": total_payload_bytes,
-            "file_size_kb": file_size_kb,
-        }
-        return True
 
     def format_descriptor(self):
         """Format-, Pyramiden- und Gebietsbeschreibung fuer ``index.json``.
@@ -729,7 +656,6 @@ class HrrrWindProcessor:
     def process_om_file(self, om_path, output_filename=None):
         step_start_time = time.perf_counter()
         self.last_step_timings = {}
-        self.last_tile_stats = {}
         _t_mark = step_start_time
 
         def _lap(name):
@@ -762,58 +688,16 @@ class HrrrWindProcessor:
 
         # --- B. HRRR liegt in Lambert-Conformal-Projektion vor -> auf das reguläre
         # Lat/Lon-Zwischengitter resampeln (Open-Meteo-kompatibles Format)
-        u_grid, v_grid, valid_mask = self._resample_to_regular_grid(u_raw, v_raw)
+        u_grid, v_grid = self._resample_to_regular_grid(u_raw, v_raw)
         _lap("resample")
 
-        # --- NUR FUER DAS FELD-WEBP (auskommentiert) ---------------------------------
-        # Farbcodiertes Windgeschwindigkeits-Overlay: Windgeschwindigkeit berechnen,
-        # auf das Mercator-Zielgitter ziehen, in 13 Farbstufen quantisieren und als
-        # verlustfreies WebP speichern. Fuer die Tiles nicht noetig.
-        #
-        # # --- C. Feldbild (Windgeschwindigkeit in Knoten, farbcodiert) rendern ---
-        # u_clean = np.nan_to_num(u_grid, nan=0.0)
-        # v_clean = np.nan_to_num(v_grid, nan=0.0)
-        #
-        # wind_speed_knots = np.sqrt(u_clean**2 + v_clean**2) * 1.94384
-        #
-        # grid_data = map_coordinates(wind_speed_knots, self.interp_coords, order=1, mode='nearest')
-        # grid_valid = map_coordinates(valid_mask.astype(float), self.interp_coords, order=0, mode='nearest')
-        #
-        # conditions = [
-        #     (grid_data < 3) & (grid_valid > 0.5),
-        #     (grid_data < 5) & (grid_valid > 0.5),
-        #     (grid_data < 6) & (grid_valid > 0.5),
-        #     (grid_data < 7) & (grid_valid > 0.5),
-        #     (grid_data < 8) & (grid_valid > 0.5),
-        #     (grid_data < 9) & (grid_valid > 0.5),
-        #     (grid_data < 10) & (grid_valid > 0.5),
-        #     (grid_data < 12) & (grid_valid > 0.5),
-        #     (grid_data < 15) & (grid_valid > 0.5),
-        #     (grid_data < 20) & (grid_valid > 0.5),
-        #     (grid_data < 25) & (grid_valid > 0.5),
-        #     (grid_data >= 25) & (grid_valid > 0.5)
-        # ]
-        #
-        # choices_indices = np.arange(1, len(conditions) + 1)
-        # selected_color_indices = np.select(conditions, choices_indices, default=0)
-        # img_array = self.color_palette[selected_color_indices]
-        #
-        # img = Image.fromarray(img_array)  # RGBA wird aus dem uint8-Array abgeleitet
-        # _lap("field")
-        #
-        # # --- D. Feldbild (Windgeschwindigkeits-Overlay) speichern ---
-        # output_webp_path = os.path.join(self.output_folder, output_filename)
-        # img.save(output_webp_path, format="WEBP", lossless=True, method=4)
-        # _lap("webp_save")
-        # --- ENDE NUR FUER DAS FELD-WEBP --------------------------------------------
-
-        # --- E. Tiles (einzelne gzip-Dateien pro Kachel, Tileserver-Layout) ---
+        # --- C. Tiles (einzelne gzip-Dateien pro Kachel, Tileserver-Layout) ---
         # output_filename traegt nur den Zeitstempel ("...Z") als Namensbasis.
         # Ergebnis: <output>/tiles/<timestamp>/<z>/<x>/<y>.bin
         # Die Geo-/Format-Infos stehen im 24-Byte-Kachelkopf; die Liste der
         # vorhandenen Kacheln liefert self.last_tile_coords.
         tiles_dir = os.path.join(self.output_folder, TILES_SUBDIR, output_filename)
-        success_tiles = self._create_wind_direction_tiles(u_grid, v_grid, tiles_dir)
+        self._create_wind_direction_tiles(u_grid, v_grid, tiles_dir)
         _lap("tiles")
 
         if os.path.exists(om_path):
@@ -835,4 +719,4 @@ class HrrrWindProcessor:
             f"    📁 Tiles {tile_files} Dateien, "
             f"{tile_bytes_total / 1048576.0:.2f} MiB -> {tiles_dir}"
         )
-        return success_tiles
+        return True

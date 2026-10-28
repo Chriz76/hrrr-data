@@ -1,0 +1,9 @@
+# Pipeline-Ausgabe (Deploy-Ordner und temporaere .om-Downloads)
+/t/
+/output/
+/om_temp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

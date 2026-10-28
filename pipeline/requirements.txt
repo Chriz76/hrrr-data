@@ -2,5 +2,4 @@ numpy
 scipy
 requests
 omfiles
-pmtiles
 aiohttp
