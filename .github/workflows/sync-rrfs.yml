@@ -1,0 +1,96 @@
+name: Run RRFS Pipeline & Upload to Bunny Storage
+
+# Parallel-Pipeline fuer den HRRR-Nachfolger RRFS (ncep_rrfs_conus_15min).
+#
+# Eigene Storage-Zone "rrfs" + eigene Pull Zone, damit sich HRRR- und
+# RRFS-Betrieb nicht in die Quere kommen:
+#   - Run-IDs sind modellunabhaengig (YYYYMMDD_HHMM) und wuerden in derselben
+#     Zone kollidieren (beide Modelle haben einen 08Z-Run).
+#   - index.json im Root ist pro Zone eindeutig; ein RRFS-Test kann den
+#     produktiven HRRR-Index nicht umschalten.
+#
+# Layout in der Zone (identisch zu sync.yml):
+#   runs/<run>/tiles/<ts>/<z>/<x>/<y>.bin   (vor-komprimiert, gzip)
+#   index.json                              (Root: Timestamps, Format, Bounds,
+#                                            Coverage, tiles_url)
+#
+# Benoetigt:
+#   Variable  BUNNY_STORAGE_ZONE = rrfs (siehe unten)
+#   Secret    BUNNY_STORAGE_PASSWORD_RRFS   (Access-Key der Zone "rrfs")
+#
+# Einmalige Pull-Zone-Konfiguration (Edge Rules fuer Content-Encoding/Cache,
+# CORS) siehe README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'RRFS-Run im Format YYYY-MM-DDTHH:MM (UTC)'
+        required: true
+        type: string
+
+concurrency:
+  # Bewusst eigener Group-Name: sonst serialisiert sich ein manueller
+  # RRFS-Test gegen den laufenden HRRR-Job (beide waeren "pipeline-<ref>").
+  group: pipeline-rrfs-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BUNNY_ENDPOINT: https://storage.bunnycdn.com
+  BUNNY_STORAGE_ZONE: rrfs
+  # Modellwahl fuer pipeline/src/pipeline.py (Windfeld-Format erkennt process.py)
+  MODEL: ncep_rrfs_conus_15min
+  OUTPUT_DIR: ./t
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r pipeline/requirements.txt
+
+      - name: Run pipeline
+        id: pipeline
+        env:
+          TARGET_RUN: ${{ github.event.inputs.run }}
+        run: python pipeline/src/pipeline.py
+
+      - name: Output pruefen
+        run: |
+          set -euo pipefail
+          if [ ! -f "$OUTPUT_DIR/index.json" ]; then
+            echo "::error::$OUTPUT_DIR/index.json fehlt - die Pipeline hat nichts erzeugt"
+            exit 1
+          fi
+          echo "Tile-Sets: $(find "$OUTPUT_DIR/tiles" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          echo "Dateien:   $(find "$OUTPUT_DIR" -type f | wc -l)"
+          echo "Volumen:   $(du -sh "$OUTPUT_DIR" | cut -f1)"
+
+      - name: Upload nach Bunny Storage
+        env:
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD_RRFS }}
+          RUN_ID: ${{ steps.pipeline.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          : "${RUN_ID:?Run-ID fehlt - die Pipeline hat keine run_id ausgegeben}"
+          python pipeline/src/upload_bunny.py \
+            --dir "$OUTPUT_DIR" \
+            --run "$RUN_ID" \
+            --prune
