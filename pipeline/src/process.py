@@ -114,6 +114,75 @@ HRRR_DX = float((_x_ne - _x_origin) / (HRRR_NX - 1))
 HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 
 
+# --- 2b. WIND-QUELLFORMAT ---
+#
+# Open-Meteo legt die 10-m-Winde je Modell unterschiedlich ab:
+#
+#   ncep_hrrr_conus_15min   wind_u_component_10m / wind_v_component_10m
+#                           (m/s, grid-relativ)
+#   ncep_rrfs_conus_15min   wind_speed_10m / wind_direction_10m
+#   ncep_nbm_conus          (m/s, meteorologische Richtung "woher",
+#                            bereits auf True North gedreht)
+#
+# Die Kacheln speichern u/v, und eine Richtung darf wegen des 0/360-Sprungs
+# nicht interpoliert werden. Das Quellformat wird deshalb pro Datei am Inhalt
+# erkannt - die Pipeline braucht keinen Modellschalter.
+
+WIND_U_VARIABLE = "wind_u_component_10m"
+WIND_V_VARIABLE = "wind_v_component_10m"
+WIND_SPEED_VARIABLE = "wind_speed_10m"
+WIND_DIRECTION_VARIABLE = "wind_direction_10m"
+
+
+def _speed_direction_to_uv(speed, direction):
+    """(Betrag [m/s], Richtung "woher" [Grad, True North]) -> (u, v) [m/s].
+
+    u zeigt nach Osten, v nach Norden. Wind aus Nord (0/360 Grad) weht nach
+    Sueden -> v negativ; Wind aus Ost (90 Grad) weht nach Westen -> u negativ.
+    """
+    spd = np.asarray(speed, dtype=np.float32)
+    rad = np.deg2rad(np.asarray(direction, dtype=np.float32))
+    u = -spd * np.sin(rad)
+    v = -spd * np.cos(rad)
+    missing = ~np.isfinite(spd) | ~np.isfinite(rad)
+    if missing.any():
+        u[missing] = np.nan
+        v[missing] = np.nan
+    return u, v
+
+
+def read_wind_uv(root):
+    """Liest das 10-m-Windfeld eines geoeffneten .om-Containers als (u, v).
+
+    Erkennt das Format automatisch (siehe oben) und liefert zusaetzlich einen
+    Namen fuer die Log-Ausgabe zurueck: ``(u, v, layout)``.
+
+    Wirft ``ValueError``, wenn kein bekanntes Windfeld enthalten ist.
+    """
+    names = {root.get_child_by_index(i).name for i in range(root.num_children)}
+
+    if WIND_U_VARIABLE in names and WIND_V_VARIABLE in names:
+        return (
+            np.asarray(root.get_child_by_name(WIND_U_VARIABLE).read_array(...)),
+            np.asarray(root.get_child_by_name(WIND_V_VARIABLE).read_array(...)),
+            "u/v",
+        )
+
+    if WIND_SPEED_VARIABLE in names and WIND_DIRECTION_VARIABLE in names:
+        u, v = _speed_direction_to_uv(
+            root.get_child_by_name(WIND_SPEED_VARIABLE).read_array(...),
+            root.get_child_by_name(WIND_DIRECTION_VARIABLE).read_array(...),
+        )
+        return u, v, "speed/direction"
+
+    raise ValueError(
+        "kein bekanntes Windfeld "
+        f"(weder {WIND_U_VARIABLE}/{WIND_V_VARIABLE} noch "
+        f"{WIND_SPEED_VARIABLE}/{WIND_DIRECTION_VARIABLE}); "
+        f"vorhanden: {sorted(names)}"
+    )
+
+
 # --- 3. TILE-PAYLOAD (int16-Delta + Ganz-Tile-gzip) ---
 #
 # Pro Kachel werden U und V als je ein zeilenweise delta-kodierter int16-Stream
@@ -222,6 +291,9 @@ class HrrrWindProcessor:
         # (siehe _resample_to_regular_grid)
         self.source_had_nan = False
         self._nan_warned = False
+        # Zuletzt gesehenes Windfeld-Format ("u/v" oder "speed/direction") fuer
+        # eine einmalige Log-Zeile statt einer pro Timestep.
+        self._layout_logged = None
 
         # Auflösung des regulären Lat/Lon-Zwischengitters (Open-Meteo-kompatibel)
         self.src_resolution = src_resolution
@@ -321,7 +393,7 @@ class HrrrWindProcessor:
             # --- Langsamer Pfad: NaN in den Quelldaten -> Maske mitsampeln ---
             if not self._nan_warned:
                 print(
-                    "   ⚠️ NaN in den HRRR-Quelldaten -> "
+                    "   ⚠️ NaN in den Wind-Quelldaten -> "
                     "datengetriebene Resample-Maske aktiv."
                 )
                 self._nan_warned = True
@@ -678,12 +750,18 @@ class HrrrWindProcessor:
         print(f"-> Verarbeite: {os.path.basename(om_path)} -> {output_filename}...")
 
         # --- A. .om einlesen ---
+        # Das Windfeld liegt je Modell als u/v oder als Betrag/Richtung vor ->
+        # read_wind_uv() erkennt das am Inhalt und liefert immer u/v.
         with OmFileReader(om_path) as root:
-            u_node = root.get_child_by_name("wind_u_component_10m")
-            v_node = root.get_child_by_name("wind_v_component_10m")
+            try:
+                u_raw, v_raw, layout = read_wind_uv(root)
+            except ValueError as exc:
+                print(f"❌ {os.path.basename(om_path)}: {exc}")
+                return False
 
-            u_raw = u_node.read_array(...)
-            v_raw = v_node.read_array(...)
+            if layout != self._layout_logged:
+                print(f"   ℹ️ Windfeld-Format: {layout}")
+                self._layout_logged = layout
         _lap("read")
 
         # --- B. HRRR liegt in Lambert-Conformal-Projektion vor -> auf das reguläre

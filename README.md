@@ -1,7 +1,18 @@
 # hrrr-data
 
-Pipeline, die HRRR-10-m-Wind (Open-Meteo `.om`-Dateien) in vor-komprimierte
+Pipeline, die 10-m-Wind (Open-Meteo `.om`-Dateien) in vor-komprimierte
 Web-Mercator-Kacheln umrechnet und nach Bunny Storage hochlaedt.
+
+Das Modell ist per `MODEL` waehlbar. HRRR wird **Ende November 2026** von
+Open-Meteo abgeschaltet, Nachfolger ist RRFS:
+
+| `MODEL` | Zeitraum | Horizont |
+|---|---|---|
+| `ncep_hrrr_conus_15min` (Default) | bis Ende Nov 2026 | +18 h |
+| `ncep_rrfs_conus_15min` | ab Ende Nov 2026 | +18 h (erste Datei +0:15, **kein** +0:00) |
+
+Welches Windfeld in der `.om` steckt (u/v oder Betrag/Richtung), erkennt
+`process.py` selbst - es gibt keinen weiteren Modellschalter.
 
 ## Ablauf
 
@@ -17,10 +28,39 @@ Starten (manuell):
 TARGET_RUN=2026-10-27T12:00 OUTPUT_DIR=./t python pipeline/src/pipeline.py
 ```
 
-`TARGET_RUN` ist der HRRR-Run im Format `YYYY-MM-DDTHH:MM` (UTC). Fehlt er,
+`TARGET_RUN` ist der Run im Format `YYYY-MM-DDTHH:MM` (UTC). Fehlt er,
 wird `jetzt - 2h` auf die volle Stunde verwendet. Weitere Env-Variablen:
-`OUTPUT_DIR`, `TEMP_OM_DIR`, `HORIZON_15MIN_HOURS` (Default 6),
+`MODEL`, `OUTPUT_DIR`, `TEMP_OM_DIR`, `HORIZON_15MIN_HOURS` (Default 6),
 `HORIZON_END_HOURS` (Default 18), `PRED_GZIP_LEVEL`.
+
+RRFS-Beispiel:
+
+```
+MODEL=ncep_rrfs_conus_15min TARGET_RUN=2026-11-15T09:00 OUTPUT_DIR=./t \
+    python pipeline/src/pipeline.py
+```
+
+## Einzelnen Zeitschritt pruefen (ohne Volumen)
+
+`pipeline/tools/check_wind.py` prueft die ganze Kette an **einem**
+Zeitschritt und braucht dafuer nur eine lokale `.om`-Datei (13 MB):
+
+```
+python pipeline/tools/check_wind.py --om /pfad/rrfs_1200.om \
+    --api-model ncep_rrfs_conus_15min
+```
+
+Es laesst die echte Pipeline auf der Datei laufen, dekodiert die erzeugten
+Kacheln an sieben Testpunkten und vergleicht sie mit dem Quellwert an der
+entsprechenden LCC-Gitterzelle. Geprueft werden damit Format-Erkennung,
+Umrechnung, Gitterabbildung, Nordausrichtung, Delta-Kodierung und Skala -
+also alles ausser der Zeitreihen-Logik (index.json, Horizont, Pruning).
+
+Die Richtungs*konvention* (True North, "woher") kann der Rueckvergleich
+nicht beweisen, weil sie auf dem Rueckweg wieder herausfaellt; dafuer dient
+`--api-model` (winziger JSON-Request). Referenzwerte aus dem Betrieb:
+max. Abweichung Quelle<->Kachel ca. 0,9 m/s und 3 Grad (bilineares
+Resampling von 3 km auf 0,025 Grad).
 
 Ein voller Lauf umfasst ~37 Zeitstempel (25 x 15 min bis +6 h, danach 12
 stuendliche bis +18 h) mit ~613 Kacheln je Zeitstempel.
@@ -35,6 +75,23 @@ index.json                               Root: Timestamps, Format, Bounds, Cover
 `index.json` ist der einzige Einstiegspunkt und wird erst umgeschaltet, wenn der
 komplette Run oben ist (atomarer Switch). Danach werden aeltere Runs geloescht
 (`--keep-runs`, Default 1).
+
+## Zwei Workflows, zwei Zonen
+
+HRRR und RRFS laufen **parallel** und schreiben in getrennte Zonen - sonst
+kollidieren sie: die Run-IDs sind modellunabhaengig (`YYYYMMDD_HHMM`, beide
+Modelle haben einen 08Z-Run), und `index.json` liegt im Root der Zone. Ein
+RRFS-Test wuerde sonst den produktiven HRRR-Index umschalten.
+
+| Workflow | Modell | Zone | Secret |
+|---|---|---|---|
+| `sync.yml` | `ncep_hrrr_conus_15min` | `gdsfgfsdgsfd` | `BUNNY_STORAGE_PASSWORD` |
+| `sync-rrfs.yml` | `ncep_rrfs_conus_15min` | `rrfs` | `BUNNY_STORAGE_PASSWORD_RRFS` |
+
+Beide haben eine eigene `concurrency.group`, damit ein manueller RRFS-Lauf
+nicht gegen den HRRR-Job serialisiert. Die Edge Rules der Pull Zone
+(`Content-Encoding: gzip`, Cache-Override, CORS) muessen fuer die RRFS-Zone
+einmal separat angelegt werden (siehe unten).
 
 ## Kachel-Format
 

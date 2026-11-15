@@ -16,10 +16,15 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./output")
 TEMP_OM_DIR = os.environ.get("TEMP_OM_DIR", "./om_temp")
 API_VERSION = "1.1.0"
 
-# Open-Meteo Modellname aus S3. Es gibt nur noch EINEN Datensatz: der
-# 15-Minuten-Datensatz deckt denselben Zeitraum ab wie der stündliche
-# ('ncep_hrrr_conus'), also werden auch die ganzen Stunden aus ihm geholt.
-MODEL_NAME_15MIN = "ncep_hrrr_conus_15min"  # HRRR: stündliche Runs, 15-Min-Schritte
+# Open-Meteo Modellname aus S3. Es gibt nur EINEN Datensatz: der
+# 15-Minuten-Datensatz deckt denselben Zeitraum ab wie der stündliche, also
+# werden auch die ganzen Stunden aus ihm geholt.
+#
+#   ncep_hrrr_conus_15min   HRRR  - 18 h, bis Ende November 2026 abgeschaltet
+#   ncep_rrfs_conus_15min   RRFS  - 18 h, Nachfolger (ab +0:15, kein +0:00)
+#
+# Das Windfeld-Format (u/v oder Betrag/Richtung) erkennt process.py selbst.
+MODEL_NAME_15MIN = os.environ.get("MODEL", "ncep_hrrr_conus_15min")
 
 # Ablage der Tiles im Deploy-Ordner (siehe process.py):
 #     tiles/<timestamp>/<z>/<x>/<y>.bin   (bereits gzip-komprimiert)
@@ -158,7 +163,8 @@ def run_hrrr_pipeline():
 
     print(f"\n========================================================")
     print(
-        f"START HRRR-PIPELINE (15-Minuten) - Run: {target_time.strftime('%Y-%m-%dT%H:%M')}Z"
+        f"START PIPELINE ({MODEL_NAME_15MIN}) - Run: "
+        f"{target_time.strftime('%Y-%m-%dT%H:%M')}Z"
     )
     print(f"========================================================")
 
