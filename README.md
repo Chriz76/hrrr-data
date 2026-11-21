@@ -11,6 +11,7 @@ HRRR Ende November 2026 ab:
 | `ncep_rrfs_conus_15min` (**aktiv**, gesetzt in `sync.yml`) | Nachfolger, gleiches CONUS-Gitter | +18 h (erste Datei +0:15, **kein** +0:00) |
 | `ncep_hrrr_conus_15min` (Default im Code) | Vorgaenger, nur noch Rueckfallebene | +18 h |
 | `knmi_harmonie_arome_europe` | KNMI HARMONIE Europe, 5,5 km, stuendlich | bis +60 h verfuegbar; `sync-knmi.yml` liest +0...+28 h |
+| `ncep_nbm_conus` | NBM CONUS, 2,54 km, stuendlich | stuendlich bis +36 h, dann 3-stuendlich bis ~+260 h; `sync-nbm.yml` liest +0...+30 h |
 
 Welches Windfeld in der `.om` steckt (u/v oder Betrag/Richtung), erkennt
 `process.py` selbst - es gibt keinen weiteren Modellschalter. Ein Wechsel
@@ -28,6 +29,26 @@ KNMI-Besonderheiten (in `process.py` als `KnmiWindProcessor` gekapselt):
   `read_wind_uv()` rechnet das in geografische u/v um
 - Erwartung: ~194 Kacheln/Zeitstempel, Ø 7,7 KiB, ~1,5 MiB/ts,
   29 ts (+0...+28) = ~42 MiB und ~5.600 Dateien
+
+NBM-Besonderheiten (in `process.py` als `NbmWindProcessor` gekapselt):
+
+- eigenes LCC-Gitter (Kugel 6371200, SP 25, `lon_0 = -95`, `lat_0 = 0`),
+  2345 x 1597, `dx = dy = 2539,7 m` - **nicht** das HRRR-Gitter; die
+  Projektion ist deshalb eine parametrisierte `_LambertConformal`-Klasse
+- geografische Huelle: 19,23...54,37 °N / -126,28...-59,04 °O (Gitterecken);
+  der abgetastete Rand reicht etwas weiter, wie bei HRRR
+- Zielgitter **0,0225°** regulaeres Lat/Lon = 2505 m meridional und damit
+  ohne Unterabtastung gegenueber den 2539,7 m der Quelle
+- `max_zoom = 7`, `finest_stride = 1`: eine z7-Kachel hat hier 125 Knoten pro
+  Kante (HRRR: 112,5) - gleiche Groessenordnung, keine Frontend-Aenderung
+- Quelle ist `wind_speed_10m`/`wind_direction_10m` (m/s, True North, "woher")
+- Erwartung: ~600 Kacheln/Zeitstempel (Domain ist groesser als HRRR),
+  31 ts (+0...+30) = ~19.000 Dateien, ~400 MiB
+
+Alle Modelle schreiben dieselbe Format-ID `hrrr-wind-int16-delta` - das
+Payload-Layout (24 B Geo-Header, int16-Delta, Sentinel, Skala) ist identisch,
+damit braucht der Client nur eine einzige ID in `SUPPORTED_FORMAT_IDS`.
+Die Modellunterscheidung passiert ausschliesslich ueber die Pull Zone.
 
 Die Frische unterscheidet sich deutlich: RRFS ist ~2,5 h nach Run-Start
 vollstaendig, HRRR war es nach ~1,5 h. Der Trigger (Cloudflare Worker) sucht
@@ -66,6 +87,16 @@ KNMI-Beispiel (29 stuendliche Schritte, `z6`):
 MODEL=knmi_harmonie_arome_europe TARGET_RUN=2026-11-21T06:00 \
     HORIZON_END_HOURS=28 OUTPUT_DIR=./t python pipeline/src/pipeline.py
 ```
+
+NBM-Beispiel (31 stuendliche Schritte, `z7`, 0,0225 Grad):
+
+```
+MODEL=ncep_nbm_conus TARGET_RUN=2026-11-21T11:00 OUTPUT_DIR=./t \
+    python pipeline/src/pipeline.py
+```
+
+`HORIZON_END_HOURS` faellt hier auf `NbmWindProcessor.default_horizon_hours`
+(30 h) zurueck; explizit setzen ueberschreibt das.
 
 Schneller Smoke-Test (nur zwei Schritte): `HORIZON_END_HOURS=1` setzen.
 
@@ -116,6 +147,7 @@ Client musste dafuer nicht angefasst werden.
 |---|---|---|---|---|
 | `sync.yml` | `ncep_rrfs_conus_15min` | `gdsfgfsdgsfd` | `BUNNY_STORAGE_PASSWORD` | **Produktion** |
 | `sync-knmi.yml` | `knmi_harmonie_arome_europe` | `rrfs` (Test) | `BUNNY_STORAGE_PASSWORD_RRFS` | manuell, Testbetrieb |
+| `sync-nbm.yml` | `ncep_nbm_conus` | `rrfs` (Test) | `BUNNY_STORAGE_PASSWORD_RRFS` | manuell, Testbetrieb |
 | `sync-rrfs.yml` | `ncep_rrfs_conus_15min` | `rrfs` | `BUNNY_STORAGE_PASSWORD_RRFS` | Auslauf, nach dem Cutover loeschen |
 
 `sync-knmi.yml` wird **manuell** per `workflow_dispatch` gestartet (kein
@@ -125,6 +157,13 @@ zusaetzliches Bunny-Setup noetig ist. Fuer den Produktivbetrieb nur
 Die Run-IDs sind dort 11-stellig (`YYYYMMDD_HH`) - ein Trigger muss das
 gegenueber dem 13-stelligen `YYYYMMDD_HHMM` der 15-Minuten-Modelle
 unterscheiden.
+
+`sync-nbm.yml` laeuft ebenfalls nur manuell und schreibt vorerst in dieselbe
+Testzone `rrfs` (Secret der Zone: `BUNNY_STORAGE_PASSWORD_RRFS`). Achtung: KNMI
+und NBM teilen sich dort `index.json` im Root und raeumen sich mit `--prune`
+gegenseitig die `runs/` weg - es ist also immer nur ein Modell live. Fuer den
+Produktivbetrieb eigene Zone + eigenes Secret.
+Horizont 30 h (31 Zeitstempel), Timeout 60 min, ~19.000 Dateien pro Run.
 
 `sync-rrfs.yml` war der Staging-Pfad: gleiche Pipeline, eigene Zone, damit
 RRFS getestet werden konnte, ohne den produktiven Index umzuschalten. Nach

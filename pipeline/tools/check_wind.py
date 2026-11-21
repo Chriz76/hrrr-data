@@ -45,18 +45,10 @@ from omfiles import OmFileReader
 _SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(_SRC))
 
+from pipeline import PROCESSORS  # noqa: E402
 from process import (  # noqa: E402
-    HRRR_DX,
-    HRRR_DY,
-    HRRR_NX,
-    HRRR_NY,
-    HRRR_ORIGIN_X,
-    HRRR_ORIGIN_Y,
     PRED_SCALE,
     PRED_VALID_MAX,
-    TILE_MAX_ZOOM,
-    HrrrWindProcessor,
-    _lcc_forward,
     read_wind_uv,
 )
 
@@ -158,15 +150,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--om", required=True, help="Lokale .om-Datei (ein Zeitschritt)")
+    parser.add_argument("--model", default="ncep_hrrr_conus_15min",
+                        choices=sorted(PROCESSORS),
+                        help="Modell: bestimmt Processor, Gitter und Zoomprofil")
     parser.add_argument("--points", default=";".join(DEFAULT_POINTS),
                         help="Testpunkte 'lat,lon;lat,lon;...'")
-    parser.add_argument("--zoom", type=int, default=TILE_MAX_ZOOM,
-                        help=f"Zoomstufe fuer den Rueckvergleich (Default {TILE_MAX_ZOOM})")
+    parser.add_argument("--zoom", type=int, default=None,
+                        help="Zoomstufe fuer den Rueckvergleich "
+                             "(Default: max_zoom des Modells)")
     parser.add_argument("--api-model", default=None,
                         help="Optional: Modellname fuer den API-Vergleich, "
-                             "z.B. ncep_rrfs_conus_15min")
+                             "z.B. ncep_rrfs_conus_15min oder ncep_nbm_conus")
     parser.add_argument("--keep", action="store_true", help="Arbeitsordner behalten")
     args = parser.parse_args()
+
+    processor_cls = PROCESSORS[args.model]
+    zoom = processor_cls.max_zoom if args.zoom is None else args.zoom
 
     source = Path(args.om)
     if not source.is_file():
@@ -183,17 +182,28 @@ def main() -> int:
         reference_time = int(root.get_child_by_name("forecast_reference_time").read_scalar())
         u_src, v_src, layout = read_wind_uv(root)
 
-    if u_src.shape != (HRRR_NY, HRRR_NX):
-        print(f"❌ unerwartete Gitterform {u_src.shape}, erwartet {(HRRR_NY, HRRR_NX)}")
+    if u_src.shape == (processor_cls.grid_nx, processor_cls.grid_ny) and u_src.shape != (
+        processor_cls.grid_ny, processor_cls.grid_nx
+    ):
+        # Defensive: falls das .om transponiert vorliegt (Spalten zuerst)
+        u_src = u_src.T
+        v_src = v_src.T
+
+    if u_src.shape != (processor_cls.grid_ny, processor_cls.grid_nx):
+        print(
+            f"❌ unerwartete Gitterform {u_src.shape}, "
+            f"erwartet {(processor_cls.grid_ny, processor_cls.grid_nx)} ({args.model})"
+        )
         return 1
 
     print(f"Quelle   : {source}")
+    print(f"Modell   : {args.model} -> {processor_cls.name}")
     print(f"Format   : {layout}")
     print(f"Run/gueltig: {datetime.fromtimestamp(reference_time, timezone.utc):%Y-%m-%dT%H:%M}Z"
           f" / {datetime.fromtimestamp(valid_time, timezone.utc):%Y-%m-%dT%H:%M}Z")
 
     started = time.perf_counter()
-    processor = HrrrWindProcessor(output_folder=str(work))
+    processor = processor_cls(output_folder=str(work))
     if not processor.process_om_file(str(staged), output_filename="check"):
         print("❌ process_om_file fehlgeschlagen")
         return 1
@@ -213,20 +223,21 @@ def main() -> int:
     for spec in points:
         lat, lon = (float(x) for x in spec.split(","))
 
-        x, y = _lcc_forward(lat, lon)
-        row_src = int(round((float(y) - HRRR_ORIGIN_Y) / HRRR_DY))
-        col_src = int(round((float(x) - HRRR_ORIGIN_X) / HRRR_DX))
+        x, y = processor_cls._forward(lat, lon)
+        row_src = int(round((float(y) - processor_cls.origin_y) / processor_cls.dy))
+        col_src = int(round((float(x) - processor_cls.origin_x) / processor_cls.dx))
 
-        tx, ty = tile_xy(lat, lon, args.zoom)
-        tile_path = tiles_dir / str(args.zoom) / str(tx) / f"{ty}.bin"
+        tx, ty = tile_xy(lat, lon, zoom)
+        tile_path = tiles_dir / str(zoom) / str(tx) / f"{ty}.bin"
 
-        if not (0 <= row_src < HRRR_NY and 0 <= col_src < HRRR_NX):
+        if not (0 <= row_src < processor_cls.grid_ny
+                and 0 <= col_src < processor_cls.grid_nx):
             print(f"{lat:7.2f} {lon:8.2f} | ausserhalb des Modellgitters")
             continue
         s_u, s_v = float(u_src[row_src, col_src]), float(v_src[row_src, col_src])
         if not tile_path.is_file():
             print(f"{lat:7.2f} {lon:8.2f} | Quelle {s_u:6.2f}/{s_v:6.2f} | "
-                  f"keine Kachel {args.zoom}/{tx}/{ty}")
+                  f"keine Kachel {zoom}/{tx}/{ty}")
             continue
 
         uv, (row_t, col_t) = tile_value(tile_path, lat, lon)
@@ -245,7 +256,8 @@ def main() -> int:
               f"{t_spd:10.2f} {t_dir:5.0f} | {d_spd:+6.2f} {d_dir:5.1f}")
 
     print(f"\nmax. Abweichung: {worst_speed:.2f} m/s, {worst_dir:.1f} Grad")
-    print("(Bilinear-Resampling auf 0,025 Grad -> kleine Abweichungen sind normal;\n"
+    print(f"(Bilinear-Resampling auf {processor_cls.default_resolution} Grad -> "
+          "kleine Abweichungen sind normal;\n"
           " bei sehr schwachem Wind ist die Richtung ohnehin instabil.)")
 
     if args.api_model:
@@ -258,8 +270,8 @@ def main() -> int:
             except Exception as exc:      # noqa: BLE001 - nur Diagnose
                 print(f"{lat:7.2f} {lon:8.2f} | API-Fehler: {exc}")
                 continue
-            tx, ty = tile_xy(lat, lon, args.zoom)
-            uv, _ = tile_value(tiles_dir / str(args.zoom) / str(tx) / f"{ty}.bin", lat, lon)
+            tx, ty = tile_xy(lat, lon, zoom)
+            uv, _ = tile_value(tiles_dir / str(zoom) / str(tx) / f"{ty}.bin", lat, lon)
             if uv is None:
                 print(f"{lat:7.2f} {lon:8.2f} | {a_spd:8.1f} {a_dir:5.0f} | -")
                 continue

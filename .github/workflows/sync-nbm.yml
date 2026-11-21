@@ -1,0 +1,131 @@
+name: Run NBM Pipeline & Upload to Bunny Storage
+
+# NBM CONUS (ncep_nbm_conus):
+#   2,54 km, stuendliche Runs, stuendliche Daten bis +36 h,
+#   danach 3-stuendlich bis ~+260 h.
+#
+# Diese Pipeline liest +0 ... +30 h (31 stuendliche Zeitstempel). Der Horizont
+# steckt in HORIZON_END_HOURS unten; der Processor-Default ist derselbe.
+#
+# Eigenes Gitter (LCC, SP 25, lon_0 -95, R 6371200) -> eigener Processor
+# NbmWindProcessor in pipeline/src/process.py, Zielauflösung 0,0225 Grad
+# (= 2539,7 m, keine Unterabtastung), Pyramide bis z7 wie HRRR.
+# Kachel-Format-ID ist bewusst "hrrr-wind-int16-delta" (identisches Payload).
+#
+# Kein Trigger: Start manuell per workflow_dispatch.
+#   run = YYYY-MM-DDTHH:MM (UTC), z.B. 2026-11-21T11:00
+#
+# BENOETIGT (einmalig):
+#   * Secret BUNNY_STORAGE_PASSWORD_RRFS (Passwort der Zone "rrfs")
+#   * Edge Rules der Pull Zone wie bei hrrr.b-cdn.net:
+#       *.bin -> Content-Encoding: gzip, Cache-Control: no-store, no-transform
+#       *.json -> Cache-Control: no-store
+#       CORS: Access-Control-Allow-Origin: *
+#
+# TESTBETRIEB: schreibt vorerst in die vorhandene Zone "rrfs", damit kein
+# zusaetzliches Bunny-Setup noetig ist (wie sync-knmi.yml). ACHTUNG: KNMI
+# schreibt ebenfalls dorthin. Beide Modelle setzen index.json im Root der Zone
+# um und raeumen alte runs/ mit --prune ab - wer zuletzt laeuft, ist live.
+# Fuer den Produktivbetrieb nur BUNNY_STORAGE_ZONE und das Secret auf eine
+# eigene NBM-Zone umstellen.
+#
+# Layout in der Zone (identisch zu sync.yml / sync-knmi.yml):
+#   runs/<run>/tiles/<ts>/<z>/<x>/<y>.bin   vor-komprimiert (gzip)
+#   index.json                              Root (atomarer Switch am Ende)
+#   Run-IDs sind 11-stellig (YYYYMMDD_HH).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'NBM-Run im Format YYYY-MM-DDTHH:MM (UTC)'
+        required: true
+        type: string
+
+concurrency:
+  # Eigener Group-Name: laeuft nicht gegen RRFS (sync.yml) oder KNMI.
+  group: pipeline-nbm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BUNNY_ENDPOINT: https://storage.bunnycdn.com
+  # TEST: vorhandene, ungenutzte Zone (wie sync-knmi.yml). Spaeter eigene Zone "nbm".
+  BUNNY_STORAGE_ZONE: rrfs
+  MODEL: ncep_nbm_conus
+  OUTPUT_DIR: ./t
+  # 30 h Vorhersage -> 31 stündliche Zeitstempel (+0 ... +30)
+  HORIZON_END_HOURS: "30"
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    # NBM: 31 Zeitstempel x ~600 Kacheln = ~19.000 Dateien pro Run.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r pipeline/requirements.txt
+
+      - name: Run pipeline
+        id: pipeline
+        env:
+          TARGET_RUN: ${{ github.event.inputs.run }}
+        run: python pipeline/src/pipeline.py
+
+      - name: Output pruefen
+        run: |
+          set -euo pipefail
+          if [ ! -f "$OUTPUT_DIR/index.json" ]; then
+            echo "::error::$OUTPUT_DIR/index.json fehlt - die Pipeline hat nichts erzeugt"
+            exit 1
+          fi
+          echo "Tile-Sets: $(find "$OUTPUT_DIR/tiles" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          echo "Dateien:   $(find "$OUTPUT_DIR" -type f | wc -l)"
+          echo "Volumen:   $(du -sh "$OUTPUT_DIR" | cut -f1)"
+
+      - name: Format/Bounds im Index pruefen
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          idx = json.load(open(os.path.join(os.environ["OUTPUT_DIR"], "index.json")))
+          print("run       :", idx["run"])
+          print("step_type :", idx["step_type"])
+          print("format    :", idx["format"]["id"])
+          print("pyramid   :", idx["pyramid"])
+          print("bounds    :", {k: round(v, 4) for k, v in idx["bounds"].items()})
+          print("steps     :", len(idx["available_timestamps"]),
+                idx["available_timestamps"][0], "->", idx["available_timestamps"][-1])
+          PY
+
+      # Jeder Run landet unter runs/<run>/. Erst wenn der komplette Run oben
+      # ist, wird index.json im Root umgestellt (atomarer Switch); danach
+      # werden aeltere Runs geloescht.
+      - name: Upload nach Bunny Storage
+        env:
+          # Zugangsdaten der rrfs-Zone (TEST). Spaeter eigenes NBM-Secret.
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD_RRFS }}
+          RUN_ID: ${{ steps.pipeline.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          : "${RUN_ID:?Run-ID fehlt - die Pipeline hat keine run_id ausgegeben}"
+          python pipeline/src/upload_bunny.py \
+            --dir "$OUTPUT_DIR" \
+            --run "$RUN_ID" \
+            --prune \
+            --keep-runs 2

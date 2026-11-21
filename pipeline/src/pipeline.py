@@ -8,7 +8,7 @@ import requests
 
 # process.py liegt im selben Ordner: beim Aufruf `python pipeline/src/pipeline.py`
 # ist dieses Verzeichnis bereits sys.path[0].
-from process import HrrrWindProcessor, KnmiWindProcessor
+from process import HrrrWindProcessor, KnmiWindProcessor, NbmWindProcessor
 
 
 # --- KONFIGURATION ---
@@ -21,6 +21,7 @@ API_VERSION = "1.1.0"
 #   ncep_hrrr_conus_15min        HRRR  - 18 h, bis Ende November 2026 abgeschaltet
 #   ncep_rrfs_conus_15min        RRFS  - 18 h, Nachfolger (ab +0:15, kein +0:00)
 #   knmi_harmonie_arome_europe   KNMI  - 60 h, stuendlich (hier meist nur 28 h)
+#   ncep_nbm_conus               NBM   - stuendlich bis +36 h, dann 3-stuendlich bis +260 h
 #
 # Das Windfeld-Format (u/v oder Betrag/Richtung) erkennt process.py selbst.
 MODEL_NAME = os.environ.get("MODEL", "ncep_hrrr_conus_15min")
@@ -31,6 +32,7 @@ PROCESSORS = {
     "ncep_hrrr_conus_15min": HrrrWindProcessor,
     "ncep_rrfs_conus_15min": HrrrWindProcessor,
     "knmi_harmonie_arome_europe": KnmiWindProcessor,
+    "ncep_nbm_conus": NbmWindProcessor,
 }
 PROCESSOR_CLS = PROCESSORS.get(MODEL_NAME, HrrrWindProcessor)
 
@@ -42,6 +44,7 @@ TILES_DIR_NAME = "tiles"
 # Budget eines vollen 15-Minuten-Runs: ~37 Zeitstempel (25 x 15-min bis +6h,
 # dann 12 stuendliche bis +18h) x ~613 Kacheln = ~22.700 Dateien + index.json.
 # KNMI (hourly, 28 h, z6): 29 Zeitstempel x ~194 Kacheln = ~5.600 Dateien.
+# NBM  (hourly, 30 h, z7): 31 Zeitstempel x ~600 Kacheln = ~19.000 Dateien.
 #
 # Der Deploy-Ordner enthaelt immer nur den aktuellen Run: alte Tile-Sets werden
 # zu Beginn des Laufs entfernt. Alte Runs in der Zone raeumt upload_bunny.py
@@ -51,10 +54,18 @@ TILES_DIR_NAME = "tiles"
 #   15min-Modelle:
 #     +0 .. +HORIZON_15MIN_HOURS   -> alle 15 Minuten (HHMM)
 #     danach .. +HORIZON_END_HOURS -> nur ganze Stunden (HH)
-#   hourly-Modelle (KNMI):
+#   hourly-Modelle (KNMI, NBM):
 #     +0 .. +HORIZON_END_HOURS     -> ausschliesslich ganze Stunden (HH)
+#
+# Ohne HORIZON_END_HOURS gilt der Default des Processors
+# (``default_horizon_hours``, sonst 18 h).
 HORIZON_15MIN_HOURS = int(os.environ.get("HORIZON_15MIN_HOURS", "6"))
-HORIZON_END_HOURS = int(os.environ.get("HORIZON_END_HOURS", "18"))
+HORIZON_END_HOURS = int(
+    os.environ.get(
+        "HORIZON_END_HOURS",
+        str(getattr(PROCESSOR_CLS, "default_horizon_hours", 18)),
+    )
+)
 
 
 def download_file(url, local_path):

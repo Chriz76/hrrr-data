@@ -35,7 +35,9 @@ def tile_bounds_wgs84(z, x, y):
 #                  projection=LambertConformalConicProjection(
 #                      λ0=-97.5, ϕ0=0, ϕ1=38.5, ϕ2=38.5, radius=6371229))
 #
-# Die folgenden Funktionen reproduzieren diese Projektion exakt.
+# Die folgenden Funktionen reproduzieren diese Projektion exakt. Die
+# Konstanten stehen in einer Klasse, weil NBM CONUS dasselbe Verfahren mit
+# anderen Parametern nutzt (siehe Abschnitt 2c).
 
 HRRR_NX = 1799
 HRRR_NY = 1059
@@ -44,65 +46,81 @@ HRRR_LON_ORIGIN = -122.72
 HRRR_LAT_NE = 47.8424         # NE-Ecke (dient nur der dx/dy-Berechnung)
 HRRR_LON_NE = -60.918
 
-_LCC_PHI1 = 38.5              # 1. Standardparallel (Latin1)
-_LCC_PHI2 = 38.5              # 2. Standardparallel (Latin2)
-_LCC_LAM0 = -97.5             # Zentralmeridian (LoV)
-_LCC_PHI0 = 0.0               # Referenzbreite (LaD)
-_LCC_RADIUS = 6371229.0
+# Parameter der beiden LCC-Gitter, die diese Pipeline bedient:
+#
+#                 Radius      SP1/SP2   lon_0     lat_0
+#   HRRR / RRFS   6371229 m   38.5      -97.5     0.0
+#   NBM CONUS     6371200 m   25.0      -95.0     0.0
+#
+# lat_0 (Latitude of false origin) ist bei beiden 0.0 und wirkt damit nur als
+# y-Offset; die Herkunft ist ohnehin die SW-Ecke des jeweiligen Gitters.
+# Die Werte stammen aus dem crs_wkt der .om (verifiziert gegen
+# api.open-meteo.com/data/<modell>/static/meta.json).
 
 
-def _lcc_constants():
-    """Berechnet die LCC-Konstanten n, F und ρ0 (Kugel)."""
-    phi1 = math.radians(_LCC_PHI1)
-    phi2 = math.radians(_LCC_PHI2)
-    phi0 = math.radians(_LCC_PHI0)
+class _LambertConformal:
+    """Lambert-Conformal-Projektion (2SP, Kugel) mit eigenen Konstanten."""
 
-    if abs(phi1 - phi2) < 1e-12:
-        n = math.sin(phi1)
-    else:
-        n = math.log(math.cos(phi1) / math.cos(phi2)) / math.log(
-            math.tan(math.pi / 4 + phi2 / 2) / math.tan(math.pi / 4 + phi1 / 2)
-        )
+    def __init__(self, phi1_deg, phi2_deg, lam0_deg, phi0_deg, radius):
+        phi1 = math.radians(phi1_deg)
+        phi2 = math.radians(phi2_deg)
+        phi0 = math.radians(phi0_deg)
 
-    f = (math.cos(phi1) * math.tan(math.pi / 4 + phi1 / 2) ** n) / n
-    rho0 = f / math.tan(math.pi / 4 + phi0 / 2) ** n
-    return n, f, rho0
+        if abs(phi1 - phi2) < 1e-12:
+            n = math.sin(phi1)
+        else:
+            n = math.log(math.cos(phi1) / math.cos(phi2)) / math.log(
+                math.tan(math.pi / 4 + phi2 / 2) / math.tan(math.pi / 4 + phi1 / 2)
+            )
+
+        self.n = n
+        self.f = (math.cos(phi1) * math.tan(math.pi / 4 + phi1 / 2) ** n) / n
+        self.rho0 = self.f / math.tan(math.pi / 4 + phi0 / 2) ** n
+        self.lam0 = math.radians(lam0_deg)
+        self.radius = float(radius)
+
+    def forward(self, lat, lon):
+        """Geografisch (Grad) -> projizierte Meter."""
+        lat = np.asarray(lat, dtype=np.float64)
+        lon = np.asarray(lon, dtype=np.float64)
+
+        theta = self.n * (np.radians(lon) - self.lam0)
+        p = self.f / np.tan(np.pi / 4 + np.radians(lat) / 2) ** self.n
+
+        x = self.radius * p * np.sin(theta)
+        y = self.radius * (self.rho0 - p * np.cos(theta))
+        return x, y
+
+    def inverse(self, x, y):
+        """Projizierte Meter -> geografisch (Grad)."""
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+
+        x_sk = x / self.radius
+        y_sk = y / self.radius
+
+        theta = np.arctan2(x_sk, self.rho0 - y_sk)
+        rho = np.sqrt(x_sk ** 2 + (self.rho0 - y_sk) ** 2)
+
+        phi = 2 * np.arctan((self.f / rho) ** (1.0 / self.n)) - np.pi / 2
+        lam = self.lam0 + theta / self.n
+
+        lat = np.degrees(phi)
+        lon = (np.degrees(lam) + 180.0) % 360.0 - 180.0
+        return lat, lon
 
 
-_LCC_N, _LCC_F, _LCC_RHO0 = _lcc_constants()
-_LCC_LAM0_RAD = math.radians(_LCC_LAM0)
+HRRR_LCC = _LambertConformal(38.5, 38.5, -97.5, 0.0, 6371229.0)
 
 
 def _lcc_forward(lat, lon):
-    """Lambert-Conformal-Vorwärtsprojektion (Kugel) nach Metern."""
-    lat = np.asarray(lat, dtype=np.float64)
-    lon = np.asarray(lon, dtype=np.float64)
-
-    theta = _LCC_N * (np.radians(lon) - _LCC_LAM0_RAD)
-    p = _LCC_F / np.tan(np.pi / 4 + np.radians(lat) / 2) ** _LCC_N
-
-    x = _LCC_RADIUS * p * np.sin(theta)
-    y = _LCC_RADIUS * (_LCC_RHO0 - p * np.cos(theta))
-    return x, y
+    """HRRR/RRFS-Vorwärtsprojektion (Kompatibilitäts-Wrapper)."""
+    return HRRR_LCC.forward(lat, lon)
 
 
 def _lcc_inverse(x, y):
-    """Umkehrung der Lambert-Conformal-Projektion (Kugel)."""
-    x = np.asarray(x, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-
-    x_sk = x / _LCC_RADIUS
-    y_sk = y / _LCC_RADIUS
-
-    theta = np.arctan2(x_sk, _LCC_RHO0 - y_sk)
-    rho = np.sqrt(x_sk ** 2 + (_LCC_RHO0 - y_sk) ** 2)
-
-    phi = 2 * np.arctan((_LCC_F / rho) ** (1.0 / _LCC_N)) - np.pi / 2
-    lam = _LCC_LAM0_RAD + theta / _LCC_N
-
-    lat = np.degrees(phi)
-    lon = (np.degrees(lam) + 180.0) % 360.0 - 180.0
-    return lat, lon
+    """HRRR/RRFS-Umkehrung (Kompatibilitäts-Wrapper)."""
+    return HRRR_LCC.inverse(x, y)
 
 
 # Ursprung (SW-Ecke) und effektive Rasterweite des nativen HRRR-Gitters
@@ -203,6 +221,42 @@ KNMI_ORIGIN_X = float(_x_sw)
 KNMI_ORIGIN_Y = float(_y_sw)
 KNMI_DX = float((_x_ne - _x_sw) / (KNMI_NX - 1))   # -0.05
 KNMI_DY = float((_y_ne - _y_sw) / (KNMI_NY - 1))   # -0.05
+
+
+# --- 2c. NBM-PROJEKTION (Lambert Conformal Conic) ---
+#
+# NBM CONUS ("ncep_nbm_conus") nutzt dasselbe Projektionsverfahren wie HRRR,
+# aber mit eigenen Parametern:
+#
+#   ProjectionGrid(nx=2345, ny=1597, dx=dy=2539.7 m,
+#                  projection=LambertConformalConic(
+#                      λ0=-95.0, ϕ0=0, ϕ1=25.0, ϕ2=25.0, radius=6371200))
+#
+# Die BBOX im crs_wkt nennt die Gitterecken (0,0) und (nx-1, ny-1):
+#   19.228985, -126.27699 .. 54.372913, -59.042786
+#
+# Anders als beim KNMI ist das KEIN rotiertes Gitter: die geografische Huelle
+# wird wie bei HRRR aus dem abgetasteten Gitterrand bestimmt.
+#
+# Rasterweite 2539,7 m = 0,0228 Grad meridional. Meridional ist das die
+# Referenz fuer die Zielaufloesung; zonal ist LCC bei 25 Grad Standardparallel
+# ebenfalls 0,0252 Grad und weiter noerdlich feiner (Stauchung).
+
+NBM_NX = 2345
+NBM_NY = 1597
+NBM_LAT_SW = 19.228985
+NBM_LON_SW = -126.27699
+NBM_LAT_NE = 54.372913
+NBM_LON_NE = -59.042786
+
+NBM_LCC = _LambertConformal(25.0, 25.0, -95.0, 0.0, 6371200.0)
+
+_nbm_x_sw, _nbm_y_sw = NBM_LCC.forward(NBM_LAT_SW, NBM_LON_SW)
+_nbm_x_ne, _nbm_y_ne = NBM_LCC.forward(NBM_LAT_NE, NBM_LON_NE)
+NBM_ORIGIN_X = float(_nbm_x_sw)
+NBM_ORIGIN_Y = float(_nbm_y_sw)
+NBM_DX = float((_nbm_x_ne - _nbm_x_sw) / (NBM_NX - 1))   # ~2539.7
+NBM_DY = float((_nbm_y_ne - _nbm_y_sw) / (NBM_NY - 1))   # ~2539.7
 
 
 # --- 2b. WIND-QUELLFORMAT ---
@@ -959,9 +1013,48 @@ class KnmiWindProcessor(HrrrWindProcessor):
     default_resolution = 0.05
     max_zoom = 6
     finest_stride = 1
-    format_id = "knmi-wind-int16-delta"
+    # Bewusst dieselbe Format-ID wie HRRR/RRFS: das Payload-Layout ist
+    # byte-identisch (24B Geo-Header, int16-Delta, sentinel, scale). Damit
+    # braucht der Client keine zweite ID in SUPPORTED_FORMAT_IDS.
+    format_id = "hrrr-wind-int16-delta"
     run_key_format = "%Y%m%d_%H"
     step_type = "hourly"
 
     _forward = staticmethod(_rot_forward)
     _inverse = staticmethod(_rot_inverse)
+
+
+class NbmWindProcessor(HrrrWindProcessor):
+    """NBM CONUS (``ncep_nbm_conus``).
+
+    - 2345 x 1597 auf eigenem LCC-Gitter (2539,7 m), Zielgitter 0,0225°
+      regulaeres Lat/Lon -> keine Unterabtastung gegenueber der Quelle.
+    - Stuendliche Runs; stuendliche Daten bis +36 h, danach 3-stuendlich
+      bis ~+260 h. Diese Pipeline liest standardmaessig +0 ... +30 h
+      (31 stuendliche Zeitstempel).
+    - Quellfeld ist ``wind_speed_10m``/``wind_direction_10m`` (m/s, True North,
+      "woher"); ``read_wind_uv()`` rechnet das bereits in u/v um.
+    - Kachel-Pyramide bis z7 wie HRRR. Bei 0,0225° hat eine z7-Kachel 125
+      Knoten pro Kante (HRRR: 112,5) -> gleiche Groessenordnung, gleiche
+      Pfeildichte im Frontend.
+    """
+
+    name = "NBM"
+    grid_nx = NBM_NX
+    grid_ny = NBM_NY
+    origin_x = NBM_ORIGIN_X
+    origin_y = NBM_ORIGIN_Y
+    dx = NBM_DX
+    dy = NBM_DY
+    default_resolution = 0.0225
+    max_zoom = 7
+    finest_stride = 1
+    # Payload-Layout identisch zu HRRR/RRFS/KNMI (siehe KNMI-Kommentar).
+    format_id = "hrrr-wind-int16-delta"
+    run_key_format = "%Y%m%d_%H"
+    step_type = "hourly"
+    # Nur ein Default, per HORIZON_END_HOURS weiterhin ueberschreibbar.
+    default_horizon_hours = 30
+
+    _forward = staticmethod(NBM_LCC.forward)
+    _inverse = staticmethod(NBM_LCC.inverse)
