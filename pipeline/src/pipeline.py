@@ -147,8 +147,10 @@ def run_hrrr_pipeline():
     hrrr_run_env = os.environ.get("HRRR_TARGET_RUN") or os.environ.get("TARGET_RUN")
 
     if not hrrr_run_env:
-        # Fallback: Falls keine Umgebungsvariable gesetzt ist, nutzen wir vorangehende UTC-Stunde
-        fallback_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        # Fallback ohne gesetzte Variable: 3 h zurueck auf die volle Stunde. Der
+        # neueste vollstaendige RRFS-Run ist ~2,5 h nach Run-Start verfuegbar,
+        # 2 h wuerden also regelmaessig auf einen noch unvollstaendigen Lauf zeigen.
+        fallback_time = datetime.now(timezone.utc) - timedelta(hours=3)
         hrrr_run_env = fallback_time.strftime("%Y-%m-%dT%H:00")
         print(f"ℹ️ Keine 'HRRR_TARGET_RUN'/'TARGET_RUN' Variable gesetzt. Verwende automatischen Fallback-Run: {hrrr_run_env}")
 

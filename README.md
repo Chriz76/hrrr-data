@@ -3,16 +3,21 @@
 Pipeline, die 10-m-Wind (Open-Meteo `.om`-Dateien) in vor-komprimierte
 Web-Mercator-Kacheln umrechnet und nach Bunny Storage hochlaedt.
 
-Das Modell ist per `MODEL` waehlbar. HRRR wird **Ende November 2026** von
-Open-Meteo abgeschaltet, Nachfolger ist RRFS:
+Das Modell ist per `MODEL` waehlbar. **Aktiv ist RRFS** - Open-Meteo schaltet
+HRRR Ende November 2026 ab:
 
-| `MODEL` | Zeitraum | Horizont |
+| `MODEL` | Rolle | Horizont |
 |---|---|---|
-| `ncep_hrrr_conus_15min` (Default) | bis Ende Nov 2026 | +18 h |
-| `ncep_rrfs_conus_15min` | ab Ende Nov 2026 | +18 h (erste Datei +0:15, **kein** +0:00) |
+| `ncep_rrfs_conus_15min` (**aktiv**, gesetzt in `sync.yml`) | Nachfolger, gleiches CONUS-Gitter | +18 h (erste Datei +0:15, **kein** +0:00) |
+| `ncep_hrrr_conus_15min` (Default im Code) | Vorgaenger, nur noch Rueckfallebene | +18 h |
 
 Welches Windfeld in der `.om` steckt (u/v oder Betrag/Richtung), erkennt
-`process.py` selbst - es gibt keinen weiteren Modellschalter.
+`process.py` selbst - es gibt keinen weiteren Modellschalter. Ein Wechsel
+zurueck auf HRRR ist damit eine Env-Variable.
+
+Die Frische unterscheidet sich deutlich: RRFS ist ~2,5 h nach Run-Start
+vollstaendig, HRRR war es nach ~1,5 h. Der Trigger (Cloudflare Worker) sucht
+deshalb ein 6-h-Fenster ab, nicht mehr nur 6 Stunden ab der vollen Stunde.
 
 ## Ablauf
 
@@ -29,7 +34,8 @@ TARGET_RUN=2026-10-27T12:00 OUTPUT_DIR=./t python pipeline/src/pipeline.py
 ```
 
 `TARGET_RUN` ist der Run im Format `YYYY-MM-DDTHH:MM` (UTC). Fehlt er,
-wird `jetzt - 2h` auf die volle Stunde verwendet. Weitere Env-Variablen:
+wird `jetzt - 3h` auf die volle Stunde verwendet (der neueste RRFS-Run ist
+~2,5 h nach Run-Start verfuegbar). Weitere Env-Variablen:
 `MODEL`, `OUTPUT_DIR`, `TEMP_OM_DIR`, `HORIZON_15MIN_HOURS` (Default 6),
 `HORIZON_END_HOURS` (Default 18), `PRED_GZIP_LEVEL`.
 
@@ -76,22 +82,31 @@ index.json                               Root: Timestamps, Format, Bounds, Cover
 komplette Run oben ist (atomarer Switch). Danach werden aeltere Runs geloescht
 (`--keep-runs`, Default 1).
 
-## Zwei Workflows, zwei Zonen
+## Zone und Workflows
 
-HRRR und RRFS laufen **parallel** und schreiben in getrennte Zonen - sonst
-kollidieren sie: die Run-IDs sind modellunabhaengig (`YYYYMMDD_HHMM`, beide
-Modelle haben einen 08Z-Run), und `index.json` liegt im Root der Zone. Ein
-RRFS-Test wuerde sonst den produktiven HRRR-Index umschalten.
+Es gibt **eine** produktive Storage-Zone (`gdsfgfsdgsfd`, Pull Zone
+`hrrr.b-cdn.net`). `sync.yml` schreibt dorthin und liefert seit der
+Umschaltung RRFS-Daten - der Zonen- und Hostname ist damit historisch, der
+Client musste dafuer nicht angefasst werden.
 
-| Workflow | Modell | Zone | Secret |
-|---|---|---|---|
-| `sync.yml` | `ncep_hrrr_conus_15min` | `gdsfgfsdgsfd` | `BUNNY_STORAGE_PASSWORD` |
-| `sync-rrfs.yml` | `ncep_rrfs_conus_15min` | `rrfs` | `BUNNY_STORAGE_PASSWORD_RRFS` |
+| Workflow | Modell | Zone | Secret | Status |
+|---|---|---|---|---|
+| `sync.yml` | `ncep_rrfs_conus_15min` | `gdsfgfsdgsfd` | `BUNNY_STORAGE_PASSWORD` | **Produktion** |
+| `sync-rrfs.yml` | `ncep_rrfs_conus_15min` | `rrfs` | `BUNNY_STORAGE_PASSWORD_RRFS` | Auslauf, nach dem Cutover loeschen |
 
-Beide haben eine eigene `concurrency.group`, damit ein manueller RRFS-Lauf
-nicht gegen den HRRR-Job serialisiert. Die Edge Rules der Pull Zone
-(`Content-Encoding: gzip`, Cache-Override, CORS) muessen fuer die RRFS-Zone
-einmal separat angelegt werden (siehe unten).
+`sync-rrfs.yml` war der Staging-Pfad: gleiche Pipeline, eigene Zone, damit
+RRFS getestet werden konnte, ohne den produktiven Index umzuschalten. Nach
+dem Cutover ist er redundant und sollte entfernt werden (auch auf `master`),
+sonst bleibt ein dispatchbarer Workflow uebrig, der in eine verwaiste Zone
+schreibt.
+
+## Rollback
+
+Zurueck auf HRRR = `MODEL` in `sync.yml` auf `ncep_hrrr_conus_15min` setzen
+und neu bauen. Das geht nur, solange Open-Meteo HRRR noch vorhaelt. Nach dem
+ersten RRFS-Lauf liegen in der Zone `--keep-runs` Runs (Default 1), d. h. das
+Rollback-Fenster ueber die Zone selbst ist kurz; fuer den ersten Lauf nach der
+Umschaltung empfiehlt sich `--keep-runs 3`.
 
 ## Kachel-Format
 

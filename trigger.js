@@ -16,12 +16,15 @@ export default {
       "User-Agent": "Cloudflare-Worker"
     };
 
-    // HRRR / Open-Meteo S3 Konfiguration
-    // Der 15-Minuten-Datensatz endet immer bei +18 h (geprüft: +19 h = 404);
-    // nur die 48-h-Zyklen (00/06/12/18Z) gehen im stündlichen Datensatz weiter.
-    // Ein Bucket erscheint stündlich und ist ~1,5 h nach Run-Start vollständig.
-    const modelName = "ncep_hrrr_conus_15min";
-    const hoursToCheck = 6; // Suchfenster in Stunden (Lag ~1,5 h)
+    // Open-Meteo S3 Konfiguration.
+    // Modell ist RRFS (Nachfolger von HRRR, gleiches CONUS-Gitter und gleiches
+    // 18-h-Produkt). Die 15-Minuten-Daten enden bei +18 h (geprueft: +19 h = 404);
+    // der stuendliche RRFS-Datensatz geht bis +84 h - fuer diese Pipeline
+    // irrelevant, sie liest ausschliesslich den 15-Minuten-Datensatz.
+    // Ein Bucket erscheint stuendlich und ist ~2,5 h nach Run-Start vollstaendig
+    // (HRRR lag bei ~1,5 h). Die Analyse-Datei +0:00 fehlt; erste Datei ist +0:15.
+    const modelName = "ncep_rrfs_conus_15min";
+    const hoursToCheck = 6; // Suchfenster in Stunden (Lag ~2,5 h)
     const forecastOffsetHours = 18; // letzte Datei des Runs = +18 h (HORIZON_END_HOURS)
 
     // SCHRITT 1: Prüfen, ob die Pipeline bereits läuft oder wartet.
@@ -40,7 +43,7 @@ export default {
       }
     }
 
-    // SCHRITT 2: Neuesten VOLLSTÄNDIGEN HRRR-Run (Open-Meteo S3) ermitteln
+    // SCHRITT 2: Neuesten VOLLSTAENDIGEN RRFS-Run (Open-Meteo S3) ermitteln
     // Auf die volle Stunde abrunden: die S3-Buckets sind stündlich (HH00Z).
     const utcNow = new Date(Math.floor(Date.now() / 3600000) * 3600000);
     let targetTime = null;
@@ -72,18 +75,18 @@ export default {
       if (headResp.status === 200) {
         targetTime = checkTime;
         targetRunString = folderStr;
-        console.log(`🎯 Neuer vollständiger HRRR-Run (inkl. ${isoFile}) gefunden: ${targetRunString}Z`);
+        console.log(`🎯 Neuer vollstaendiger RRFS-Run (inkl. ${isoFile}) gefunden: ${targetRunString}Z`);
         break;
       }
     }
 
     if (!targetTime) {
-      console.log("❌ Kein vollständiger HRRR-Datensatz im Abfragefenster gefunden.");
+      console.log("❌ Kein vollstaendiger RRFS-Datensatz im Abfragefenster gefunden.");
       return;
     }
 
     // SCHRITT 3: Prüfen, ob dieser Run schon live ist.
-    // Die HRRR-Pipeline lädt die Kacheln direkt nach Bunny Storage und stellt am
+    // Die Pipeline lädt die Kacheln direkt nach Bunny Storage und stellt am
     // Ende index.json im Root der Zone um. index.json.run ist die Run-ID des
     // aktuell live stehenden Runs (Format YYYYMMDD_HHMM, siehe pipeline.py).
     const rY = targetTime.getUTCFullYear();

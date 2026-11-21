@@ -30,8 +30,10 @@ env:
   # Fest aus dem Access-Tab der Zone (Frankfurt, DE).
   BUNNY_ENDPOINT: https://storage.bunnycdn.com
   BUNNY_STORAGE_ZONE: gdsfgfsdgsfd
-  # Die Pipeline schreibt direkt in den Deploy-Ordner.
-  OUTPUT_DIR: ./t
+  # Datenquelle: RRFS (Nachfolger von HRRR), ~2,5 h nach Run-Start vollstaendig.
+  # process.py erkennt das Windfeld-Format (u/v oder Betrag/Richtung) selbst.
+  MODEL: ncep_rrfs_conus_15min
+  OUTPUT_DIR: ./t  # Deploy-Ordner der Pipeline
   # Parallelitaet (48 PUTs / 24 DELETEs) und das Rollback-Fenster (KEEP_RUNS=1)
   # stehen als Defaults in pipeline/src/upload_bunny.py.
 
