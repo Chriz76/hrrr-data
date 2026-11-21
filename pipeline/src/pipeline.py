@@ -8,7 +8,7 @@ import requests
 
 # process.py liegt im selben Ordner: beim Aufruf `python pipeline/src/pipeline.py`
 # ist dieses Verzeichnis bereits sys.path[0].
-from process import HrrrWindProcessor
+from process import HrrrWindProcessor, KnmiWindProcessor
 
 
 # --- KONFIGURATION ---
@@ -16,31 +16,43 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./output")
 TEMP_OM_DIR = os.environ.get("TEMP_OM_DIR", "./om_temp")
 API_VERSION = "1.1.0"
 
-# Open-Meteo Modellname aus S3. Es gibt nur EINEN Datensatz: der
-# 15-Minuten-Datensatz deckt denselben Zeitraum ab wie der stündliche, also
-# werden auch die ganzen Stunden aus ihm geholt.
+# Open-Meteo Modellname aus S3.
 #
-#   ncep_hrrr_conus_15min   HRRR  - 18 h, bis Ende November 2026 abgeschaltet
-#   ncep_rrfs_conus_15min   RRFS  - 18 h, Nachfolger (ab +0:15, kein +0:00)
+#   ncep_hrrr_conus_15min        HRRR  - 18 h, bis Ende November 2026 abgeschaltet
+#   ncep_rrfs_conus_15min        RRFS  - 18 h, Nachfolger (ab +0:15, kein +0:00)
+#   knmi_harmonie_arome_europe   KNMI  - 60 h, stuendlich (hier meist nur 28 h)
 #
 # Das Windfeld-Format (u/v oder Betrag/Richtung) erkennt process.py selbst.
-MODEL_NAME_15MIN = os.environ.get("MODEL", "ncep_hrrr_conus_15min")
+MODEL_NAME = os.environ.get("MODEL", "ncep_hrrr_conus_15min")
+
+# Modell -> Processor. Der Processor kennt Gitter, Zielaufloesung, Zoomprofil,
+# Schritt-Layout und Format-ID; die Pipeline selbst bleibt modellunabhaengig.
+PROCESSORS = {
+    "ncep_hrrr_conus_15min": HrrrWindProcessor,
+    "ncep_rrfs_conus_15min": HrrrWindProcessor,
+    "knmi_harmonie_arome_europe": KnmiWindProcessor,
+}
+PROCESSOR_CLS = PROCESSORS.get(MODEL_NAME, HrrrWindProcessor)
 
 # Ablage der Tiles im Deploy-Ordner (siehe process.py):
 #     tiles/<timestamp>/<z>/<x>/<y>.bin   (bereits gzip-komprimiert)
 # Format-, Bounds- und Coverage-Infos stehen einmalig in index.json.
 TILES_DIR_NAME = "tiles"
 
-# Budget eines vollen Runs: ~37 Zeitstempel (25 x 15-min bis +6h, dann 12
-# stuendliche bis +18h) x ~613 Kacheln = ~22.700 Dateien + index.json.
+# Budget eines vollen 15-Minuten-Runs: ~37 Zeitstempel (25 x 15-min bis +6h,
+# dann 12 stuendliche bis +18h) x ~613 Kacheln = ~22.700 Dateien + index.json.
+# KNMI (hourly, 28 h, z6): 29 Zeitstempel x ~194 Kacheln = ~5.600 Dateien.
 #
 # Der Deploy-Ordner enthaelt immer nur den aktuellen Run: alte Tile-Sets werden
 # zu Beginn des Laufs entfernt. Alte Runs in der Zone raeumt upload_bunny.py
 # mit --prune ab.
 
 # Horizont (per Env ueberschreibbar):
-#   +0 .. +HORIZON_15MIN_HOURS   -> alle 15 Minuten (HHMM)
-#   danach .. +HORIZON_END_HOURS -> nur ganze Stunden (HH), gleicher Datensatz
+#   15min-Modelle:
+#     +0 .. +HORIZON_15MIN_HOURS   -> alle 15 Minuten (HHMM)
+#     danach .. +HORIZON_END_HOURS -> nur ganze Stunden (HH)
+#   hourly-Modelle (KNMI):
+#     +0 .. +HORIZON_END_HOURS     -> ausschliesslich ganze Stunden (HH)
 HORIZON_15MIN_HOURS = int(os.environ.get("HORIZON_15MIN_HOURS", "6"))
 HORIZON_END_HOURS = int(os.environ.get("HORIZON_END_HOURS", "18"))
 
@@ -76,12 +88,21 @@ def download_file(url, local_path):
     return False
 
 
-def build_steps(target_time):
+def build_steps(target_time, step_type="15min"):
     """Zeitschritte des Laufs als Liste von (Zeit, Zeitstempel-Format, Label).
 
-    Erst alle 15 Minuten bis +HORIZON_15MIN_HOURS, danach nur ganze Stunden bis
-    +HORIZON_END_HOURS - beides aus demselben 15-Minuten-Datensatz.
+    15min-Modelle: erst alle 15 Minuten bis +HORIZON_15MIN_HOURS, danach nur
+    ganze Stunden bis +HORIZON_END_HOURS - beides aus demselben Datensatz.
+
+    ``hourly`` (z.B. KNMI HARMONIE): ausschliesslich ganze Stunden von +0 bis
+    +HORIZON_END_HOURS.
     """
+    if step_type == "hourly":
+        return [
+            (target_time + timedelta(hours=hour), "%Y%m%d_%H", "Stunden")
+            for hour in range(0, HORIZON_END_HOURS + 1)
+        ]
+
     steps = []
 
     horizon_15min = target_time + timedelta(hours=HORIZON_15MIN_HOURS)
@@ -165,7 +186,7 @@ def run_hrrr_pipeline():
 
     print(f"\n========================================================")
     print(
-        f"START PIPELINE ({MODEL_NAME_15MIN}) - Run: "
+        f"START PIPELINE ({MODEL_NAME}, {PROCESSOR_CLS.step_type}) - Run: "
         f"{target_time.strftime('%Y-%m-%dT%H:%M')}Z"
     )
     print(f"========================================================")
@@ -180,11 +201,11 @@ def run_hrrr_pipeline():
         shutil.rmtree(tiles_root)
         print(f"🧹 Alte Tile-Sets entfernt: {tiles_root}")
 
-    processor = HrrrWindProcessor(output_folder=OUTPUT_DIR)
+    processor = PROCESSOR_CLS(output_folder=OUTPUT_DIR)
 
-    # Key im HHMM-Format; dient gleichzeitig als Ordnername unter runs/ in der
-    # Storage-Zone (siehe upload_bunny.py).
-    detected_current_time_key = target_time.strftime("%Y%m%d_%H%M")
+    # Run-Key je Modell: "YYYYMMDD_HHMM" (15min) bzw. "YYYYMMDD_HH" (hourly);
+    # dient gleichzeitig als Ordnername unter runs/ in der Storage-Zone.
+    detected_current_time_key = target_time.strftime(PROCESSOR_CLS.run_key_format)
     publish_run_id(detected_current_time_key)
 
     processed_timestamps = []
@@ -192,7 +213,7 @@ def run_hrrr_pipeline():
     coords_per_step = []
     consecutive_missing = 0
 
-    for step_time, key_format, label in build_steps(target_time):
+    for step_time, key_format, label in build_steps(target_time, PROCESSOR_CLS.step_type):
         if consecutive_missing >= 2:
             print(
                 f"   ℹ️ Zwei Schritte hintereinander fehlend - Horizont endet vor "
@@ -206,7 +227,7 @@ def run_hrrr_pipeline():
         output_name = f"{time_key}Z"
         iso_file_name = f"{step_time.strftime('%Y-%m-%dT%H%M')}.om"
 
-        url_om = f"https://openmeteo.s3.amazonaws.com/data_spatial/{MODEL_NAME_15MIN}/{year}/{month}/{day}/{run_hour_z}/{iso_file_name}"
+        url_om = f"https://openmeteo.s3.amazonaws.com/data_spatial/{MODEL_NAME}/{year}/{month}/{day}/{run_hour_z}/{iso_file_name}"
         om_path = os.path.join(TEMP_OM_DIR, iso_file_name)
 
         print(f"   -> Downloade {label}-Schritt: {iso_file_name}...")
@@ -259,7 +280,7 @@ def run_hrrr_pipeline():
             "run": detected_current_time_key,
             "available_timestamps": all_timestamps,
             "current_hour": current_hour,
-            "step_type": "15min",
+            "step_type": PROCESSOR_CLS.step_type,
             "api_version": API_VERSION,
             # {timestamp} = "20261008_2000Z"; {z}/{x}/{y} setzt die App ein.
             "tiles_url": f"{run_prefix}/{TILES_DIR_NAME}/{{timestamp}}/{{z}}/{{x}}/{{y}}.bin",
@@ -273,7 +294,7 @@ def run_hrrr_pipeline():
         # HHMM-Keys sind 13 Zeichen ("YYYYMMDD_HHMM"), Stunden-Keys 11.
         count_15min = sum(1 for ts in all_timestamps if len(ts) > 11)
         print(f"   -> 15-Min-Schritte (HHMM): {count_15min}")
-        print(f"   -> Stunden-Schritte (HH, 15m-Datensatz): {len(all_timestamps) - count_15min}")
+        print(f"   -> Stunden-Schritte (HH):  {len(all_timestamps) - count_15min}")
         print(f"   -> Gesamt kombiniert:      {len(all_timestamps)}")
         print(f"   -> Standard-Fokus (current_hour): {current_hour}")
         if coords_per_step:

@@ -114,6 +114,97 @@ HRRR_DX = float((_x_ne - _x_origin) / (HRRR_NX - 1))
 HRRR_DY = float((_y_ne - _y_origin) / (HRRR_NY - 1))
 
 
+# --- 2a. KNMI-PROJEKTION (Rotated Lat/Lon) ---
+#
+# KNMI HARMONIE AROME Europe ("knmi_harmonie_arome_europe") liegt auf einem
+# rotierten Lat/Lon-Gitter. Open-Meteo definiert es als
+#
+#   ProjectionGrid(nx=676, ny=564,
+#                  latitude=39.740627...62.619324,
+#                  longitude=-25.162262...38.75702,
+#                  projection=RotatedLatLonProjection(latitude: -35, longitude: -8))
+#
+# Die .om-Datei bestaetigt das in ihrem crs_wkt (o_lat_p=35, lon_0=-8,
+# Kugelradius 6371229, BBOX = SW-/NE-Ecke). Die Daten liegen zeilenweise
+# Sued->Nord (Zeile 0 = Suedrand), Spalte 0 = Westrand; dx und dy sind negativ,
+# weil die rotierte Laenge nach Osten abnimmt.
+#
+# Die BBOX im WKT ist NICHT die geografische Huelle: sie enthaelt nur die Ecken
+# (0,0) und (nx-1, ny-1). Die tatsaechliche Huelle (Rand abgetastet) reicht bis
+# Island/Nordatlantik (lat 37.74...69.55, lon -42.08...38.76).
+
+KNMI_NX = 676
+KNMI_NY = 564
+KNMI_LAT_SW = 39.740627
+KNMI_LON_SW = -25.162262
+KNMI_LAT_NE = 62.619324
+KNMI_LON_NE = 38.75702
+
+_KNMI_POLE_LAT = -35.0   # RotatedLatLonProjection(latitude: -35)
+_KNMI_POLE_LON = -8.0    # RotatedLatLonProjection(longitude: -8)
+
+_ROT_THETA = math.radians(90.0 + _KNMI_POLE_LAT)
+_ROT_PHI = math.radians(_KNMI_POLE_LON)
+
+
+def _rot_forward(lat, lon):
+    """Rotierte Lat/Lon-Vorwaertsprojektion (Kugel) -> (x, y) in Grad."""
+    lat = np.asarray(lat, dtype=np.float64)
+    lon = np.asarray(lon, dtype=np.float64)
+
+    lam = np.radians(lon)
+    phi = np.radians(lat)
+
+    x = np.cos(lam) * np.cos(phi)
+    y = np.sin(lam) * np.cos(phi)
+    z = np.sin(phi)
+
+    x2 = (
+        math.cos(_ROT_THETA) * math.cos(_ROT_PHI) * x
+        + math.cos(_ROT_THETA) * math.sin(_ROT_PHI) * y
+        + math.sin(_ROT_THETA) * z
+    )
+    y2 = -math.sin(_ROT_PHI) * x + math.cos(_ROT_PHI) * y
+    z2 = (
+        -math.sin(_ROT_THETA) * math.cos(_ROT_PHI) * x
+        - math.sin(_ROT_THETA) * math.sin(_ROT_PHI) * y
+        + math.cos(_ROT_THETA) * z
+    )
+
+    return -np.degrees(np.arctan2(y2, x2)), -np.degrees(np.arcsin(z2))
+
+
+def _rot_inverse(x, y):
+    """Umkehrung der rotierten Lat/Lon-Projektion (Kugel)."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    lon = np.radians(x)
+    lat = np.radians(y)
+
+    lat2 = -np.arcsin(
+        math.cos(_ROT_THETA) * np.sin(lat)
+        - np.cos(lon) * math.sin(_ROT_THETA) * np.cos(lat)
+    )
+    lon2 = -(
+        np.arctan2(
+            np.sin(lon),
+            np.tan(lat) * math.sin(_ROT_THETA) + np.cos(lon) * math.cos(_ROT_THETA),
+        )
+        - _ROT_PHI
+    )
+    return np.degrees(lat2), (np.degrees(lon2) + 180.0) % 360.0 - 180.0
+
+
+# Ursprung (SW-Ecke) und effektive Rasterweite des nativen KNMI-Gitters
+_x_sw, _y_sw = _rot_forward(KNMI_LAT_SW, KNMI_LON_SW)
+_x_ne, _y_ne = _rot_forward(KNMI_LAT_NE, KNMI_LON_NE)
+KNMI_ORIGIN_X = float(_x_sw)
+KNMI_ORIGIN_Y = float(_y_sw)
+KNMI_DX = float((_x_ne - _x_sw) / (KNMI_NX - 1))   # -0.05
+KNMI_DY = float((_y_ne - _y_sw) / (KNMI_NY - 1))   # -0.05
+
+
 # --- 2b. WIND-QUELLFORMAT ---
 #
 # Open-Meteo legt die 10-m-Winde je Modell unterschiedlich ab:
@@ -203,6 +294,10 @@ def read_wind_uv(root):
 
 # --- 4. KACHEL-PYRAMIDE ---
 #
+# Die Werte unten sind die HRRR-Defaults. Das Gitter-Profil einer Klasse
+# (z.B. KnmiWindProcessor: max_zoom = 6) kann sie ueberschreiben; der Tiler
+# liest sie dann aus self.max_zoom / self.finest_stride.
+#
 # Das reguläre Lat/Lon-Zwischengitter wird pyramidal abgelegt:
 #
 #     Level 0..max_zoom,   stride = finest_stride * 2^(max_zoom - z)
@@ -269,15 +364,41 @@ PRED_GZIP_LEVEL = int(os.environ.get("PRED_GZIP_LEVEL", 1))   # 1 (schnell) .. 9
 
 
 class HrrrWindProcessor:
+    # --- Gitter-Profil -------------------------------------------------------
+    # Diese Attribute beschreiben die Quelle. Unterklassen (z.B.
+    # KnmiWindProcessor) ueberschreiben sie; alles andere (Resampling,
+    # Tile-Encoding, index.json) bleibt modellunabhaengig.
+    name = "HRRR"
+    grid_nx = HRRR_NX
+    grid_ny = HRRR_NY
+    origin_x = HRRR_ORIGIN_X
+    origin_y = HRRR_ORIGIN_Y
+    dx = HRRR_DX
+    dy = HRRR_DY
+    default_resolution = 0.025
+    max_zoom = TILE_MAX_ZOOM
+    finest_stride = TILE_FINEST_STRIDE
+    format_id = "hrrr-wind-int16-delta"
+    run_key_format = "%Y%m%d_%H%M"
+    step_type = "15min"
+
     #: Reihenfolge und Beschriftung der Zeitmessungen pro Timestep
     _STEP_LABELS = (
         ("read", "Read .om"),
-        ("resample", "Resample LCC->Gitter"),
+        ("resample", "Resample -> Gitter"),
         ("tiles", "Tiles schreiben"),
         ("cleanup", "Temp loeschen"),
     )
 
-    def __init__(self, output_folder="./wind_tiles_hrrr", src_resolution=0.025):
+    @staticmethod
+    def _forward(lat, lon):
+        return _lcc_forward(lat, lon)
+
+    @staticmethod
+    def _inverse(x, y):
+        return _lcc_inverse(x, y)
+
+    def __init__(self, output_folder="./wind_tiles_hrrr", src_resolution=None):
         init_start_time = time.perf_counter()
         self.output_folder = output_folder
         os.makedirs(self.output_folder, exist_ok=True)
@@ -296,10 +417,10 @@ class HrrrWindProcessor:
         self._layout_logged = None
 
         # Auflösung des regulären Lat/Lon-Zwischengitters (Open-Meteo-kompatibel)
-        self.src_resolution = src_resolution
+        self.src_resolution = src_resolution or self.default_resolution
 
-        # Geografische Hülle des nativen HRRR-CONUS-Rasters (aus der Projektion bestimmt)
-        self.lat_min, self.lat_max, self.lon_min, self.lon_max = self._hrrr_geographic_bounds()
+        # Geografische Hülle des nativen Gitters (aus der Projektion bestimmt)
+        self.lat_min, self.lat_max, self.lon_min, self.lon_max = self._geographic_bounds()
 
         # Reguläres Lat/Lon-Zielgitter (Süd->Nord bzw. West->Ost)
         self.src_lat_shape = int(round((self.lat_max - self.lat_min) / self.src_resolution)) + 1
@@ -312,12 +433,13 @@ class HrrrWindProcessor:
 
         init_duration = time.perf_counter() - init_start_time
         print(
-            f"✅ [HrrrProcessor] Gitter initialisiert: "
+            f"✅ [{type(self).__name__}] Gitter initialisiert: "
             f"Quelle {self.src_lon_shape}x{self.src_lat_shape} @ {self.src_resolution}° "
             f"(Init: {init_duration:.4f}s)"
         )
         print(
-            f"   🌍 HRRR-Gebiet / Frontend-Anker (SW): lat {self.lat_min:.5f}..{self.lat_max:.5f}, "
+            f"   🌍 {self.name}-Gebiet / Frontend-Anker (SW): "
+            f"lat {self.lat_min:.5f}..{self.lat_max:.5f}, "
             f"lon {self.lon_min:.5f}..{self.lon_max:.5f}"
         )
         print(
@@ -325,44 +447,47 @@ class HrrrWindProcessor:
             f"L{PRED_GZIP_LEVEL}"
         )
 
-    @staticmethod
-    def _hrrr_geographic_bounds(n=256):
-        """Ermittelt die geografische Hülle des nativen HRRR-LCC-Rasters.
+    def _geographic_bounds(self, n=256):
+        """Ermittelt die geografische Huelle des nativen Gitters.
 
-        Dafür wird der Gitterrand abgetastet und rückprojiziert. Liefert
+        Dafuer wird der Gitterrand abgetastet und rueckprojiziert. Liefert
         (lat_min, lat_max, lon_min, lon_max).
+
+        Die BBOX im ``crs_wkt`` einer .om-Datei ist dafuer NICHT geeignet: sie
+        enthaelt nur die Gitterecken (0,0) und (nx-1, ny-1), nicht die Extrema
+        der Huelle (beim rotierten KNMI-Gitter z.B. Island/Nordatlantik).
         """
-        xs = np.linspace(0.0, HRRR_NX - 1, n)
-        ys = np.linspace(0.0, HRRR_NY - 1, n)
+        xs = np.linspace(0.0, self.grid_nx - 1, n)
+        ys = np.linspace(0.0, self.grid_ny - 1, n)
 
         grid_i = np.concatenate([
             xs, xs,
-            np.zeros_like(ys), np.full_like(ys, HRRR_NX - 1),
+            np.zeros_like(ys), np.full_like(ys, self.grid_nx - 1),
         ])
         grid_j = np.concatenate([
-            np.full_like(xs, HRRR_NY - 1), np.zeros_like(xs),
+            np.full_like(xs, self.grid_ny - 1), np.zeros_like(xs),
             ys, ys,
         ])
 
-        x = HRRR_ORIGIN_X + grid_i * HRRR_DX
-        y = HRRR_ORIGIN_Y + grid_j * HRRR_DY
-        lat, lon = _lcc_inverse(x, y)
+        x = self.origin_x + grid_i * self.dx
+        y = self.origin_y + grid_j * self.dy
+        lat, lon = self._inverse(x, y)
 
         return float(lat.min()), float(lat.max()), float(lon.min()), float(lon.max())
 
     def _build_resample_coords(self):
         """Berechnet für jeden Punkt des regulären Lat/Lon-Zwischengitters die
-        Zeilen-/Spaltenindizes im nativen HRRR-Gitter (inkl. In-Bounds-Maske)."""
+        Zeilen-/Spaltenindizes im nativen Gitter (inkl. In-Bounds-Maske)."""
         lon_grid, lat_grid = np.meshgrid(self.src_lons, self.src_lats)
 
-        x, y = _lcc_forward(lat_grid, lon_grid)
-        row = (y - HRRR_ORIGIN_Y) / HRRR_DY
-        col = (x - HRRR_ORIGIN_X) / HRRR_DX
+        x, y = self._forward(lat_grid, lon_grid)
+        row = (y - self.origin_y) / self.dy
+        col = (x - self.origin_x) / self.dx
 
         self.resample_coords = np.array([row, col], dtype=np.float32)
         self.resample_in_bounds = (
-            (row >= 0) & (row <= HRRR_NY - 1)
-            & (col >= 0) & (col <= HRRR_NX - 1)
+            (row >= 0) & (row <= self.grid_ny - 1)
+            & (col >= 0) & (col <= self.grid_nx - 1)
         )
 
     def _resample_to_regular_grid(self, u_raw, v_raw):
@@ -382,10 +507,16 @@ class HrrrWindProcessor:
         """
         u_raw = np.asarray(u_raw)
         v_raw = np.asarray(v_raw)
-        if u_raw.shape == (HRRR_NX, HRRR_NY) and u_raw.shape != (HRRR_NY, HRRR_NX):
+        if u_raw.shape == (self.grid_nx, self.grid_ny) and u_raw.shape != (self.grid_ny, self.grid_nx):
             # Defensive: falls das .om transponiert vorliegt (Spalten zuerst)
             u_raw = u_raw.T
             v_raw = v_raw.T
+
+        if u_raw.shape != (self.grid_ny, self.grid_nx):
+            raise ValueError(
+                f"unerwartete Gitterform {u_raw.shape}, "
+                f"erwartet {(self.grid_ny, self.grid_nx)} ({self.name})"
+            )
 
         self.source_had_nan = bool(np.isnan(u_raw).any()) or bool(np.isnan(v_raw).any())
 
@@ -463,10 +594,13 @@ class HrrrWindProcessor:
         v_raw,
         output_dir,
         min_zoom=0,
-        max_zoom=TILE_MAX_ZOOM,
-        finest_stride=TILE_FINEST_STRIDE,
+        max_zoom=None,
+        finest_stride=None,
     ):
         """Schreibt je Zoomstufe/Kachel eine eigene, bereits gzip-komprimierte Datei.
+
+        ``max_zoom`` und ``finest_stride`` kommen per Default aus dem Gitter-Profil
+        der Klasse (``self.max_zoom`` / ``self.finest_stride``).
 
         Layout relativ zu ``output_dir``::
 
@@ -483,13 +617,18 @@ class HrrrWindProcessor:
 
         Als Gitter dient das reguläre Lat/Lon-Zwischengitter. Es wird bis ``max_zoom``
         pyramidal abgelegt. ``finest_stride`` ist der Abtastschritt auf der feinsten
-        Stufe: 1 = volle Auflösung (0,025°, kein Detailverlust), 2 = halbe Auflösung
-        (0,05°, 4x kleiner, dafür sichtbar unschärfer).
+        Stufe: 1 = volle Auflösung (``self.src_resolution``, kein Detailverlust),
+        2 = doppelter Abtastschritt (4x kleiner, dafür sichtbar unschärfer).
 
         Jede Kachel bekommt ``TILE_PADDING`` Zellen Halo auf allen 4 Seiten
         (siehe Konstante), damit der Client an den Kachelrändern einen äußeren
         Stützpunkt für die lineare Interpolation hat.
         """
+
+        if max_zoom is None:
+            max_zoom = self.max_zoom
+        if finest_stride is None:
+            finest_stride = self.finest_stride
 
         # 1D Koordinatenvektoren des regulären Zwischengitters
         lats = self.src_lats
@@ -678,7 +817,7 @@ class HrrrWindProcessor:
         """
         return {
             "format": {
-                "id": "hrrr-wind-int16-delta",
+                "id": self.format_id,
                 "version": 1,
                 "encoding": "gzip",
                 "layout": (
@@ -695,8 +834,8 @@ class HrrrWindProcessor:
             },
             "pyramid": {
                 "min_zoom": 0,
-                "max_zoom": TILE_MAX_ZOOM,
-                "finest_stride": TILE_FINEST_STRIDE,
+                "max_zoom": self.max_zoom,
+                "finest_stride": self.finest_stride,
                 "padding_cells": TILE_PADDING,
                 "resolution_deg": self.src_resolution,
                 "tile_ext": TILE_FILE_EXT,
@@ -764,7 +903,7 @@ class HrrrWindProcessor:
                 self._layout_logged = layout
         _lap("read")
 
-        # --- B. HRRR liegt in Lambert-Conformal-Projektion vor -> auf das reguläre
+        # --- B. Das native Gitter (LCC bzw. rotierte Lat/Lon) auf das reguläre
         # Lat/Lon-Zwischengitter resampeln (Open-Meteo-kompatibles Format)
         u_grid, v_grid = self._resample_to_regular_grid(u_raw, v_raw)
         _lap("resample")
@@ -798,3 +937,31 @@ class HrrrWindProcessor:
             f"{tile_bytes_total / 1048576.0:.2f} MiB -> {tiles_dir}"
         )
         return True
+
+
+class KnmiWindProcessor(HrrrWindProcessor):
+    """KNMI HARMONIE AROME Europe (``knmi_harmonie_arome_europe``).
+
+    - 676 x 564 auf rotiertem Lat/Lon (5,56 km), Zielgitter 0,05° regular lat/lon
+    - Quellfeld ist ``wind_speed_10m``/``wind_direction_10m`` (True North,
+      "woher"); ``read_wind_uv()`` rechnet das bereits in u/v um.
+    - Kachel-Pyramide bis z6: eine z6-Kachel deckt 4x so viel Flaeche ab wie
+      eine z7-Kachel bei gleicher Aufloesung (0,05°, ``finest_stride=1``).
+    """
+
+    name = "KNMI"
+    grid_nx = KNMI_NX
+    grid_ny = KNMI_NY
+    origin_x = KNMI_ORIGIN_X
+    origin_y = KNMI_ORIGIN_Y
+    dx = KNMI_DX
+    dy = KNMI_DY
+    default_resolution = 0.05
+    max_zoom = 6
+    finest_stride = 1
+    format_id = "knmi-wind-int16-delta"
+    run_key_format = "%Y%m%d_%H"
+    step_type = "hourly"
+
+    _forward = staticmethod(_rot_forward)
+    _inverse = staticmethod(_rot_inverse)

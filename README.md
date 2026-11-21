@@ -10,10 +10,24 @@ HRRR Ende November 2026 ab:
 |---|---|---|
 | `ncep_rrfs_conus_15min` (**aktiv**, gesetzt in `sync.yml`) | Nachfolger, gleiches CONUS-Gitter | +18 h (erste Datei +0:15, **kein** +0:00) |
 | `ncep_hrrr_conus_15min` (Default im Code) | Vorgaenger, nur noch Rueckfallebene | +18 h |
+| `knmi_harmonie_arome_europe` | KNMI HARMONIE Europe, 5,5 km, stuendlich | bis +60 h verfuegbar; `sync-knmi.yml` liest +0...+28 h |
 
 Welches Windfeld in der `.om` steckt (u/v oder Betrag/Richtung), erkennt
 `process.py` selbst - es gibt keinen weiteren Modellschalter. Ein Wechsel
 zurueck auf HRRR ist damit eine Env-Variable.
+
+KNMI-Besonderheiten (in `process.py` als `KnmiWindProcessor` gekapselt):
+
+- rotiertes Lat/Lon (`o_lat_p=35`, `lon_0=-8`), 676 x 564, `dx = dy = -0,05°`
+  (= 5,56 km), Daten zeilenweise Sued->Nord
+- Zielgitter 0,05° regulaeres Lat/Lon; `max_zoom = 6`, `finest_stride = 1`
+  (eine z6-Kachel = 4x Flaeche einer z7-Kachel bei voller Aufloesung)
+- geografische Huelle **37,74...69,55 °N / -42,08...38,76 °O**; die `BBOX` im
+  `crs_wkt` der .om ist nur die SW-/NE-Ecke und deckt Island/Nordatlantik nicht ab
+- Quelle ist `wind_speed_10m`/`wind_direction_10m` (True North, "woher");
+  `read_wind_uv()` rechnet das in geografische u/v um
+- Erwartung: ~194 Kacheln/Zeitstempel, Ø 7,7 KiB, ~1,5 MiB/ts,
+  29 ts (+0...+28) = ~42 MiB und ~5.600 Dateien
 
 Die Frische unterscheidet sich deutlich: RRFS ist ~2,5 h nach Run-Start
 vollstaendig, HRRR war es nach ~1,5 h. Der Trigger (Cloudflare Worker) sucht
@@ -45,6 +59,15 @@ RRFS-Beispiel:
 MODEL=ncep_rrfs_conus_15min TARGET_RUN=2026-11-15T09:00 OUTPUT_DIR=./t \
     python pipeline/src/pipeline.py
 ```
+
+KNMI-Beispiel (29 stuendliche Schritte, `z6`):
+
+```
+MODEL=knmi_harmonie_arome_europe TARGET_RUN=2026-11-21T06:00 \
+    HORIZON_END_HOURS=28 OUTPUT_DIR=./t python pipeline/src/pipeline.py
+```
+
+Schneller Smoke-Test (nur zwei Schritte): `HORIZON_END_HOURS=1` setzen.
 
 ## Einzelnen Zeitschritt pruefen (ohne Volumen)
 
@@ -92,7 +115,16 @@ Client musste dafuer nicht angefasst werden.
 | Workflow | Modell | Zone | Secret | Status |
 |---|---|---|---|---|
 | `sync.yml` | `ncep_rrfs_conus_15min` | `gdsfgfsdgsfd` | `BUNNY_STORAGE_PASSWORD` | **Produktion** |
+| `sync-knmi.yml` | `knmi_harmonie_arome_europe` | `rrfs` (Test) | `BUNNY_STORAGE_PASSWORD_RRFS` | manuell, Testbetrieb |
 | `sync-rrfs.yml` | `ncep_rrfs_conus_15min` | `rrfs` | `BUNNY_STORAGE_PASSWORD_RRFS` | Auslauf, nach dem Cutover loeschen |
+
+`sync-knmi.yml` wird **manuell** per `workflow_dispatch` gestartet (kein
+Trigger) und schreibt vorerst in die ungenutzte Zone `rrfs`, damit kein
+zusaetzliches Bunny-Setup noetig ist. Fuer den Produktivbetrieb nur
+`BUNNY_STORAGE_ZONE` und das Secret auf eine eigene KNMI-Zone umstellen.
+Die Run-IDs sind dort 11-stellig (`YYYYMMDD_HH`) - ein Trigger muss das
+gegenueber dem 13-stelligen `YYYYMMDD_HHMM` der 15-Minuten-Modelle
+unterscheiden.
 
 `sync-rrfs.yml` war der Staging-Pfad: gleiche Pipeline, eigene Zone, damit
 RRFS getestet werden konnte, ohne den produktiven Index umzuschalten. Nach

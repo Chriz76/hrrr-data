@@ -1,0 +1,98 @@
+name: Run KNMI HARMONIE Pipeline & Upload to Bunny Storage
+
+# KNMI HARMONIE AROME Europe (knmi_harmonie_arome_europe):
+#   5,5 km, stuendliche Runs, +0 ... +60 h.
+# Diese Pipeline liest die ersten 28 h (+0 ... +28, 29 Zeitstempel).
+#
+# TESTBETRIEB: schreibt vorerst in die vorhandene, aktuell ungenutzte Zone
+# "rrfs", damit kein neues Bunny-Setup noetig ist. Fuer den Produktivbetrieb
+# nur BUNNY_STORAGE_ZONE und das Secret auf eine eigene KNMI-Zone umstellen.
+#
+# Kein Trigger: Start manuell per workflow_dispatch.
+#   run = YYYY-MM-DDTHH:MM (UTC), z.B. 2026-11-21T06:00
+#
+# Layout in der Zone (identisch zu sync.yml):
+#   runs/<run>/tiles/<ts>/<z>/<x>/<y>.bin   vor-komprimiert (gzip)
+#   index.json                              Root (atomarer Switch am Ende)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: 'KNMI-Run im Format YYYY-MM-DDTHH:MM (UTC)'
+        required: true
+        type: string
+
+concurrency:
+  # Eigener Group-Name: laeuft nicht gegen den RRFS-Job (sync.yml).
+  group: pipeline-knmi-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BUNNY_ENDPOINT: https://storage.bunnycdn.com
+  # TEST: vorhandene, ungenutzte Zone. Spaeter eigene Zone "knmi".
+  BUNNY_STORAGE_ZONE: rrfs
+  # Modellwahl fuer pipeline/src/pipeline.py (Windfeld-Format erkennt process.py)
+  MODEL: knmi_harmonie_arome_europe
+  OUTPUT_DIR: ./t
+  # 28 h Vorhersage -> 29 stuendliche Zeitstempel (+0 ... +28)
+  HORIZON_END_HOURS: "28"
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r pipeline/requirements.txt
+
+      - name: Run pipeline
+        id: pipeline
+        env:
+          TARGET_RUN: ${{ github.event.inputs.run }}
+        run: python pipeline/src/pipeline.py
+
+      - name: Output pruefen
+        run: |
+          set -euo pipefail
+          if [ ! -f "$OUTPUT_DIR/index.json" ]; then
+            echo "::error::$OUTPUT_DIR/index.json fehlt - die Pipeline hat nichts erzeugt"
+            exit 1
+          fi
+          echo "Tile-Sets: $(find "$OUTPUT_DIR/tiles" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+          echo "Dateien:   $(find "$OUTPUT_DIR" -type f | wc -l)"
+          echo "Volumen:   $(du -sh "$OUTPUT_DIR" | cut -f1)"
+
+      # Jeder Run landet unter runs/<run>/. Erst wenn der komplette Run oben
+      # ist, wird index.json im Root umgestellt (atomarer Switch); danach
+      # werden aeltere Runs geloescht.
+      # --keep-runs 2: laesst den bisherigen RRFS-Run als Vergleich liegen.
+      - name: Upload nach Bunny Storage
+        env:
+          # Zugangsdaten der rrfs-Zone (TEST). Spaeter eigenes KNMI-Secret.
+          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD_RRFS }}
+          RUN_ID: ${{ steps.pipeline.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          : "${RUN_ID:?Run-ID fehlt - die Pipeline hat keine run_id ausgegeben}"
+          python pipeline/src/upload_bunny.py \
+            --dir "$OUTPUT_DIR" \
+            --run "$RUN_ID" \
+            --prune \
+            --keep-runs 2
